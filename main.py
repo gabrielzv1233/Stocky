@@ -1,7 +1,8 @@
 from flask import Flask, request, jsonify, render_template_string, redirect, url_for
 from flask_sqlalchemy import SQLAlchemy
-import os, random, time, json, re, posixpath
-
+import random, time, json, re, posixpath
+from sympy import sympify 
+from math import ceil 
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///stock.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -19,7 +20,6 @@ class Item(db.Model):
     uid = db.Column(db.String(10), primary_key=True)
     name = db.Column(db.String(100))
     count = db.Column(db.Integer)
-    tags = db.Column(db.String(200))
     timestamp = db.Column(db.Integer)
     category_id = db.Column(db.Integer, db.ForeignKey('category.id'), nullable=True)
 
@@ -32,7 +32,7 @@ def generate_uid():
 
 def enforce_name(name):
     trimmed = name.strip()
-    if not re.match(r'^[A-Za-z0-9 _-]+$', trimmed):
+    if not re.match(r'^[A-Za-z0-9 _\-,.]+$', trimmed):
         return None
     return trimmed
 
@@ -454,7 +454,10 @@ def item_api(uid):
         if duplicate_exists(current_cat, new_name, is_category=False, exclude_id=item.uid):
             return jsonify({"message": "An item with that name already exists in this folder.", "success": False})
         item.name = new_name
-        item.count = int(data.get('count'))
+        if re.search(r"\d", data.get('count')):
+            item.count = int(ceil(sympify(re.sub(r"[^0-9+\-*/(). ]", "", (data.get('count') or '')).strip() or '0').evalf()))
+        else:
+            item.count = item.count if item.count > 0 else 0
         item.timestamp = int(time.time())
         db.session.commit()
         return jsonify({"message": "Item updated", "success": True})
@@ -466,7 +469,7 @@ def export():
     cats = Category.query.all()
     its = Item.query.all()
     data['categories'] = [{"id": c.id, "name": c.name, "parent_id": c.parent_id} for c in cats]
-    data['items'] = [{"uid": i.uid, "name": i.name, "count": i.count, "tags": i.tags, "timestamp": i.timestamp, "category_id": i.category_id} for i in its]
+    data['items'] = [{"uid": i.uid, "name": i.name, "count": i.count, "timestamp": i.timestamp, "category_id": i.category_id} for i in its]
     return app.response_class(
         response=json.dumps(data, indent=4),
         mimetype='application/json'
@@ -493,25 +496,70 @@ def edit(uid):
         .buttons button { margin-left: 5px; padding: 10px 20px; }
         .cancel { background: #fff; color: #888; border: 1px solid #888; }
         .save { background: #007bff; color: #fff; border: none; }
+        .spancopy {
+        cursor: pointer;
+        font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+        background-color: #424242;
+        color: #E7E7E7;
+        padding: 2px 5px;
+        border-radius: 4px;
+        font-size: 0.95em;
+        white-space: nowrap;
+        }
+
     </style>
     <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 </head>
 <body>
     <div class="editor">
-        <h2>Edit Item: {{ item.name }}</h2>
+        <h2>Editing item <code class="spancopy" onclick="copyid(event)">{{ item.uid }}</code>:</h2>
         <input type="hidden" id="serverTimestamp" value="{{ item.timestamp }}">
         <label>Name:</label>
         <input type="text" id="name" value="{{ item.name }}">
         <label>Count:</label>
-        <input type="number" id="count" value="{{ item.count }}">
+        <input pattern="[0-9+\-*/(). ]*" type="text" id="count" placeholder="{{ 0 if item.count <= 0 else item.count }}" value="{{ '' if item.count <= 0 else item.count }}">
+
     </div>
     <div class="buttons">
         <button class="cancel" onclick="cancelEdit()">Cancel</button>
-        <button class="save" onclick="saveItem()">Save</button>
+        <!-- <button class="save" onclick="saveItem()">Save</button> -->
         <button class="save" onclick="saveAndExit()">Save & Exit</button>
     </div>
 <script>
+    document.addEventListener("DOMContentLoaded", function() {
+        document.querySelectorAll(".spancopy").forEach(span => {
+            span.setAttribute("title", "Click to copy");
+        });
+    });
+    function copyid(event) {
+        let span = event.target;
+        let originalText = span.innerText || span.textContent;
+
+        if (navigator.clipboard && window.isSecureContext) {
+            navigator.clipboard.writeText(originalText).then(() => {
+                span.innerText = "Copied!";
+                setTimeout(() => {
+                    span.innerText = originalText;
+                }, 1000);
+            }).catch(err => console.error("Clipboard copy failed:", err));
+        } else {
+            let textarea = document.createElement("textarea");
+            textarea.value = originalText;
+            document.body.appendChild(textarea);
+            textarea.select();
+            try {
+                document.execCommand("copy");
+                span.innerText = "Copied!";
+                setTimeout(() => {
+                    span.innerText = originalText;
+                }, 1000);
+            } catch (err) {
+                console.error("Fallback copy failed:", err);
+            }
+            document.body.removeChild(textarea);
+        }
+    }
     const uid = "{{ item.uid }}";
     const autosaveKey = "autosave_" + uid;
     const parentCat = "{{ parent_cat }}";

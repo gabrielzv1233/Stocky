@@ -1,8 +1,16 @@
-from flask import Flask, request, jsonify, render_template_string, redirect, url_for
+from flask import Flask, request, jsonify, render_template_string, redirect, url_for, send_file
 from flask_sqlalchemy import SQLAlchemy
-import random, time, json, re, posixpath
-from sympy import sympify 
+from sympy import sympify
 from math import ceil 
+from PIL import Image
+import posixpath
+import random
+import time
+import json
+import uuid
+import os
+import re
+
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///stock.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -22,6 +30,7 @@ class Item(db.Model):
     count = db.Column(db.Integer)
     timestamp = db.Column(db.Integer)
     category_id = db.Column(db.Integer, db.ForeignKey('category.id'), nullable=True)
+    image_paths = db.Column(db.Text)  # JSON-encoded list of image URLs (e.g. ["/static/uploads/abc123_1.webp", ...])
 
 with app.app_context():
     db.create_all()
@@ -462,6 +471,111 @@ def item_api(uid):
         db.session.commit()
         return jsonify({"message": "Item updated", "success": True})
 
+@app.route('/api/upload_image/<uid>', methods=['POST'])
+def upload_image(uid):
+    item = Item.query.filter_by(uid=uid).first()
+    if not item:
+        return jsonify({"message": "Item not found", "success": False}), 404
+
+    images = json.loads(item.image_paths) if item.image_paths else []
+    if len(images) >= 3:
+        return jsonify({"message": "Maximum images reached", "success": False}), 400
+
+    if 'file' not in request.files:
+        return jsonify({"message": "No file provided", "success": False}), 400
+
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"message": "No selected file", "success": False}), 400
+
+    try:
+        image = Image.open(file.stream).convert("RGBA")
+    except Exception as e:
+        return jsonify({"message": "Invalid image file", "success": False}), 400
+
+    upload_folder = os.path.join(app.root_path, 'static', 'uploads')
+    os.makedirs(upload_folder, exist_ok=True)
+
+    image_uid = uuid.uuid4().hex[:8]
+
+    # ===== Full image (downscale to max 1080px on any axis) =====
+    orig_w, orig_h = image.size
+    scale = min(1080 / orig_w, 1080 / orig_h, 1.0)  # don't upscale
+    new_orig_size = (int(orig_w * scale), int(orig_h * scale))
+    full_image = image.resize(new_orig_size, Image.Resampling.LANCZOS)
+
+    full_filename = f"{uid}_{image_uid}_full.webp"
+    full_path = os.path.join(upload_folder, full_filename)
+    full_image.save(full_path, "WEBP")
+    full_url = f"/static/uploads/{full_filename}"
+
+    # ===== Thumbnail image (crop 128x128 centered) =====
+    thumb_scale = 128 / min(orig_w, orig_h)
+    thumb_w, thumb_h = int(orig_w * thumb_scale), int(orig_h * thumb_scale)
+    thumb_image = image.resize((thumb_w, thumb_h), Image.Resampling.LANCZOS)
+
+    left = (thumb_w - 128) // 2
+    top = (thumb_h - 128) // 2
+    thumb_image = thumb_image.crop((left, top, left + 128, top + 128))
+
+    thumb_filename = f"{uid}_{image_uid}_thumb.webp"
+    thumb_path = os.path.join(upload_folder, thumb_filename)
+    thumb_image.save(thumb_path, "WEBP")
+    thumb_url = f"/static/uploads/{thumb_filename}"
+
+    images.append({
+        "thumb": thumb_url,
+        "full": full_url
+    })
+    item.image_paths = json.dumps(images)
+    db.session.commit()
+
+    return jsonify({
+        "message": "Image uploaded",
+        "success": True,
+        "image_path": thumb_url,
+        "full_path": full_url
+    })
+
+@app.route('/api/delete_image/<uid>', methods=['POST'])
+def delete_image(uid):
+    item = Item.query.filter_by(uid=uid).first()
+    if not item:
+        return jsonify({"message": "Item not found", "success": False}), 404
+
+    thumb_to_delete = request.form.get('thumb')
+    if not thumb_to_delete:
+        return jsonify({"message": "Missing thumbnail path", "success": False}), 400
+
+    images = json.loads(item.image_paths) if item.image_paths else []
+    updated_images = []
+
+    deleted_thumb = None
+    deleted_full = None
+
+    for img in images:
+        if isinstance(img, str) and img == thumb_to_delete:
+            deleted_thumb = os.path.join(app.root_path, img.lstrip("/"))
+        elif isinstance(img, dict) and img.get("thumb") == thumb_to_delete:
+            deleted_thumb = os.path.join(app.root_path, img["thumb"].lstrip("/"))
+            deleted_full = os.path.join(app.root_path, img["full"].lstrip("/"))
+        else:
+            updated_images.append(img)
+
+    if not deleted_thumb or not os.path.exists(deleted_thumb):
+        return jsonify({"message": "Image not found", "success": False}), 404
+
+    try:
+        os.remove(deleted_thumb)
+        if deleted_full and os.path.exists(deleted_full):
+            os.remove(deleted_full)
+    except Exception as e:
+        return jsonify({"message": f"Failed to delete files: {str(e)}", "success": False}), 500
+
+    item.image_paths = json.dumps(updated_images)
+    db.session.commit()
+    return jsonify({"message": "Image deleted", "success": True})
+
 # ----------------- Export -----------------
 @app.route('/export')
 def export():
@@ -476,12 +590,22 @@ def export():
     )
 
 # ----------------- Item Editor -----------------
+@app.route('/view_image/<filename>')
+def view_image(filename):
+    path = os.path.join(app.root_path, 'static', 'uploads', filename)
+    if not os.path.exists(path):
+        return "Image not found", 404
+    return send_file(path, mimetype='image/webp', as_attachment=False)
+
 @app.route('/edit/<uid>')
 def edit(uid):
     item = Item.query.filter_by(uid=uid).first()
     if not item:
         return "Item not found", 404
+
     parent_cat = request.args.get('cat', '')
+    images = json.loads(item.image_paths) if item.image_paths else []
+
     return render_template_string("""
 <!DOCTYPE html>
 <html>
@@ -497,16 +621,47 @@ def edit(uid):
         .cancel { background: #fff; color: #888; border: 1px solid #888; }
         .save { background: #007bff; color: #fff; border: none; }
         .spancopy {
-        cursor: pointer;
-        font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
-        background-color: #424242;
-        color: #E7E7E7;
-        padding: 2px 5px;
-        border-radius: 4px;
-        font-size: 0.95em;
-        white-space: nowrap;
+            cursor: pointer;
+            font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+            background-color: #424242;
+            color: #E7E7E7;
+            padding: 2px 5px;
+            border-radius: 4px;
+            font-size: 0.95em;
+            white-space: nowrap;
         }
-
+        #imageUploadContainer { margin-top: 20px; }
+        #uploadWrapper { display: inline-block; width: 128px; height: 128px; cursor: pointer; }
+        #uploadWrapper img { width: 128px; height: 128px; }
+        #imageContainer { display: inline-block; margin-left: 10px; vertical-align: top; }
+        #imageContainer img { width: 128px; height: 128px; object-fit: cover; object-position: center; margin: 5px; cursor: pointer; }
+        #imageUploadContainer {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        #uploadWrapper {
+            width: 128px;
+            height: 128px;
+            cursor: pointer;
+        }
+        #uploadWrapper img {
+            width: 100%;
+            height: 100%;
+        }
+        #imageContainer {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .uploaded-img {
+            width: 128px;
+            height: 128px;
+            object-fit: cover;
+            object-position: center;
+            cursor: pointer;
+        }
+        
     </style>
     <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
@@ -520,10 +675,20 @@ def edit(uid):
         <label>Count:</label>
         <input pattern="[0-9+\-*/(). ]*" type="text" id="count" placeholder="{{ 0 if item.count <= 0 else item.count }}" value="{{ '' if item.count <= 0 else item.count }}">
 
+        <div id="imageUploadContainer">
+            <div id="uploadWrapper">
+                <img id="uploadBtn" src="/static/upload_button.png" alt="Upload Image">
+                <input type="file" id="imageInput" accept="image/*" style="display:none">
+            </div>
+            <div id="imageContainer">
+                {% for img in images %}
+                    <img class="uploaded-img" src="{{ img.thumb }}" data-full="{{ img.full }}" alt="Uploaded Image">
+                {% endfor %}
+            </div>
+        </div>
     </div>
     <div class="buttons">
         <button class="cancel" onclick="cancelEdit()">Cancel</button>
-        <!-- <button class="save" onclick="saveItem()">Save</button> -->
         <button class="save" onclick="saveAndExit()">Save & Exit</button>
     </div>
 <script>
@@ -535,34 +700,27 @@ def edit(uid):
     function copyid(event) {
         let span = event.target;
         let originalText = span.innerText || span.textContent;
-
         if (navigator.clipboard && window.isSecureContext) {
             navigator.clipboard.writeText(originalText).then(() => {
                 span.innerText = "Copied!";
-                setTimeout(() => {
-                    span.innerText = originalText;
-                }, 1000);
-            }).catch(err => console.error("Clipboard copy failed:", err));
+                setTimeout(() => { span.innerText = originalText; }, 1000);
+            });
         } else {
             let textarea = document.createElement("textarea");
             textarea.value = originalText;
             document.body.appendChild(textarea);
             textarea.select();
-            try {
-                document.execCommand("copy");
-                span.innerText = "Copied!";
-                setTimeout(() => {
-                    span.innerText = originalText;
-                }, 1000);
-            } catch (err) {
-                console.error("Fallback copy failed:", err);
-            }
+            document.execCommand("copy");
+            span.innerText = "Copied!";
+            setTimeout(() => { span.innerText = originalText; }, 1000);
             document.body.removeChild(textarea);
         }
     }
+
     const uid = "{{ item.uid }}";
     const autosaveKey = "autosave_" + uid;
     const parentCat = "{{ parent_cat }}";
+
     $(document).ready(function(){
         let autosaveData = localStorage.getItem(autosaveKey);
         if(autosaveData){
@@ -577,7 +735,100 @@ def edit(uid):
                 }
             }
         }
+
+        $("#uploadBtn").on("click", function() {
+            if ($("#imageContainer img").length >= 3) return;
+            $("#imageInput").click();
+        });
+
+        $("#imageInput").on("change", function(e) {
+            let file = e.target.files[0];
+            if(file) {
+                uploadImage(file);
+                $(this).val("");
+            }
+        });
+
+        $("#uploadWrapper").on("dragover", function(e) {
+            e.preventDefault();
+            $(this).css("border", "2px dashed #007bff");
+        });
+        $("#uploadWrapper").on("dragleave", function(e) {
+            e.preventDefault();
+            $(this).css("border", "none");
+        });
+        $("#uploadWrapper").on("drop", function(e) {
+            e.preventDefault();
+            $(this).css("border", "none");
+            let file = e.originalEvent.dataTransfer.files[0];
+            if(file) uploadImage(file);
+        });
+
+        attachImageClickHandlers();
     });
+
+    function uploadImage(file) {
+        let formData = new FormData();
+        formData.append("file", file);
+        $.ajax({
+            url: "/api/upload_image/" + uid,
+            type: "POST",
+            data: formData,
+            processData: false,
+            contentType: false,
+            success: function(data) {
+                if(data.success) {
+                    let img = $("<img>", {
+                        src: data.image_path,
+                        "data-full": data.full_path,
+                        class: "uploaded-img",
+                        alt: "Uploaded Image"
+                    }).css({ width: "128px", height: "128px", "object-fit": "cover", "object-position": "center", margin: "5px", cursor: "pointer" });
+
+                    $("#imageContainer").append(img);
+                    attachImageClickHandlers();
+
+                    if($("#imageContainer img").length >= 3){
+                        $("#uploadWrapper").hide();
+                    }
+                } else {
+                    alert(data.message);
+                }
+            }
+        });
+    }
+
+    function attachImageClickHandlers(){
+        $(".uploaded-img").off("click").on("click", function(e) {
+            const $img = $(this);
+            if (this.clickTimeout) {
+                clearTimeout(this.clickTimeout);
+                this.clickTimeout = null;
+
+                if (confirm("Do you want to delete this image?")) {
+                    $.post("/api/delete_image/" + uid, {
+                        thumb: $img.attr("src")
+                    }, function(data) {
+                        if (data.success) {
+                            $img.remove();
+                            if ($("#imageContainer img").length < 3) {
+                                $("#uploadWrapper").show();
+                            }
+                        } else {
+                            alert(data.message);
+                        }
+                    });
+                }
+            } else {
+                this.clickTimeout = setTimeout(() => {
+                    this.clickTimeout = null;
+                    let fullPath = $img.attr("data-full").split("/").pop();
+                    window.open("/view_image/" + fullPath, "_blank");
+                }, 500);
+            }
+        });
+    }
+
     function autosave(){
         let data = {
             name: $("#name").val(),
@@ -586,6 +837,7 @@ def edit(uid):
         };
         localStorage.setItem(autosaveKey, JSON.stringify(data));
     }
+
     setInterval(autosave, 15000);
     $("input").on("blur", autosave);
     $("#count").on("keydown", function(e){
@@ -594,24 +846,24 @@ def edit(uid):
         if(e.key === "ArrowUp"){ $(this).val(val+1); e.preventDefault(); }
         else if(e.key === "ArrowDown"){ $(this).val(val-1); e.preventDefault(); }
     });
+
     function saveItem(callback){
         $.post("/api/item/" + uid, {
             name: $("#name").val(),
             count: $("#count").val(),
         }, function(data){
-            if(data.success === false){
-                alert(data.message);
-            }
+            if(data.success === false){ alert(data.message); }
             localStorage.removeItem(autosaveKey);
             if(callback) callback();
         });
     }
+
     function saveAndExit(){ saveItem(function(){ window.location.href = "/?cat=" + parentCat; }); }
     function cancelEdit(){ localStorage.removeItem(autosaveKey); window.location.href = "/?cat=" + parentCat; }
 </script>
 </body>
 </html>
-    """, item=item, parent_cat=parent_cat)
+    """, item=item, parent_cat=parent_cat, images=images)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)

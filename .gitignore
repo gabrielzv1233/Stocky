@@ -1,2 +1,3 @@
 instance/
-tags.json
+*.db
+static/uploads/

@@ -1,0 +1,4 @@
+flask
+sympy
+pillow
+flask_sqlalchemy 

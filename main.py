@@ -219,7 +219,7 @@ def explorer():
     }
     // Simple JS version of enforceName for client-side checking
     function enforceNameJS(name) {
-        let pattern = /^[A-Za-z0-9 _-]+$/;
+        let pattern = /^[A-Za-z0-9 _\-,.]+$/;
         return pattern.test(name);
     }
     // Drag & Drop functions
@@ -357,8 +357,7 @@ def move():
         current = None
 
         for part in path_parts:
-            found = Category.query.filter(db.func.lower(Category.name) == part.lower(),
-                                          Category.parent_id == (current.id if current else None)).first()
+            found = Category.query.filter(db.func.lower(Category.name) == part.lower(), Category.parent_id == (current.id if current else None)).first()
             if not found:
                 return jsonify({"message": f"Path not found: {abs_path}", "success": False})
             current = found
@@ -500,7 +499,7 @@ def upload_image(uid):
 
     # ===== Full image (downscale to max 1080px on any axis) =====
     orig_w, orig_h = image.size
-    scale = min(1080 / orig_w, 1080 / orig_h, 1.0)  # don't upscale
+    scale = min(1080 / orig_w, 1080 / orig_h, 1.0)
     new_orig_size = (int(orig_w * scale), int(orig_h * scale))
     full_image = image.resize(new_orig_size, Image.Resampling.LANCZOS)
 

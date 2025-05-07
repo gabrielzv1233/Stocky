@@ -1,3 +1,5 @@
 instance/
 *.db
 static/uploads/
+qr/
+*.xlsx

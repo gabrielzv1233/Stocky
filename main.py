@@ -47,6 +47,13 @@ gc     = gspread.authorize(creds)
 sheet  = gc.open_by_key(SPREADSHEET_ID)
 drive  = build('drive', 'v3', credentials=creds)
 
+def clear_blank_rows(worksheet):
+    all_values = worksheet.get_all_values()
+    for i in range(len(all_values), 0, -1):
+        row = all_values[i - 1]
+        if not any(cell.strip() for cell in row):
+            worksheet.delete_rows(i)
+
 def get_or_create_ws(title, headers):
     try:
         ws = sheet.worksheet(title)
@@ -61,20 +68,23 @@ ws_cats = get_or_create_ws(CATEGORIES_SHEET, ['id','name','parent_id'])
 ws_items = get_or_create_ws(ITEMS_SHEET,     ['uid','name','count','timestamp','category_id','image_paths'])
 
 def read_categories():
+    data = ws_cats.get_all_records()
+    data = [r for r in data if any(str(cell).strip() for cell in r.values())]
     return [{
         'id':        int(r['id']),
         'name':      r['name'],
-        'parent_id': int(r['parent_id']) if r['parent_id'] not in ('',None) else None
-    } for r in ws_cats.get_all_records()]
+        'parent_id': int(r['parent_id']) if r['parent_id'] not in ('', None) else None
+    } for r in data]
 
 def read_items():
     data = sheet.worksheet("items").get_all_records()
+    data = [r for r in data if any(str(cell).strip() for cell in r.values())]
     return [{
         'uid':         str(r['uid']),
         'name':        r['name'],
         'count':       int(r['count']) if r['count'] != '' else 0,
-        'timestamp':   int(r['timestamp']),
-        'category_id': int(r['category_id']),
+        'timestamp':   int(r['timestamp']) if r['timestamp'] != '' else int(time.time()),
+        'category_id': int(r['category_id']) if r['category_id'] != '' else 0,
         'image_paths': json.loads(r['image_paths']) if r['image_paths'] else []
     } for r in data]
 
@@ -119,6 +129,12 @@ def build_breadcrumb_str(cat_id,cats): return '/' + '/'.join(breadcrumb_parts(ca
 def build_breadcrumb_html(cat_id,cats): return '<b>/</b>' + '<b> / </b>'.join(breadcrumb_parts(cat_id,cats)) if cat_id else '<b>/</b>'
 
 app = Flask(__name__)
+
+@app.route('/repair')
+def repair():
+    clear_blank_rows(sheet.worksheet("items"))
+    clear_blank_rows(sheet.worksheet("categories"))
+    return jsonify(success=True, message='Blank rows cleared')
 
 @app.route('/')
 def explorer():

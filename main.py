@@ -156,7 +156,12 @@ def repair():
     clear_blank_rows(sheet.worksheet("categories"))
     repair_categories_parent_id()
     repair_items_parent_id()
-    return jsonify(success=True, message='(Possibly) repaired empty rows and parent IDs')
+    return """
+    <script>
+        alert("Repaired empty rows and parent IDs (if needed).");
+        window.location.href = "/";
+    </script>
+    """
 
 @app.route('/')
 def explorer():

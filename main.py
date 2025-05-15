@@ -47,12 +47,24 @@ gc     = gspread.authorize(creds)
 sheet  = gc.open_by_key(SPREADSHEET_ID)
 drive  = build('drive', 'v3', credentials=creds)
 
-def clear_blank_rows(worksheet):
-    all_values = worksheet.get_all_values()
+def repair(ws_items):
+    all_values = ws_items.get_all_values()
+
     for i in range(len(all_values), 0, -1):
         row = all_values[i - 1]
+
         if not any(cell.strip() for cell in row):
-            worksheet.delete_rows(i)
+            ws_items.delete_rows(i)
+            continue
+
+        if i == 1:
+            continue
+
+        if len(row) >= 5:
+            cat_id = row[4].strip()
+            if not cat_id.isdigit():
+                row[4] = '0'
+                ws_items.update_cell(i, 5, '0')
 
 def get_or_create_ws(title, headers):
     try:
@@ -77,16 +89,16 @@ def read_categories():
     } for r in data]
 
 def read_items():
-    data = sheet.worksheet("items").get_all_records()
-    data = [r for r in data if any(str(cell).strip() for cell in r.values())]
+    raw = sheet.worksheet("items").get_all_records()
+    rows = [r for r in raw if any(cell.strip() for cell in r.values())]
     return [{
         'uid':         str(r['uid']),
         'name':        r['name'],
         'count':       int(r['count']) if r['count'] != '' else 0,
-        'timestamp':   int(r['timestamp']) if r['timestamp'] != '' else int(time.time()),
-        'category_id': int(r['category_id']) if r['category_id'] != '' else 0,
+        'timestamp':   int(r['timestamp']),
+        'category_id': int(r['category_id']) if str(r['category_id']).strip().isdigit() else 0,
         'image_paths': json.loads(r['image_paths']) if r['image_paths'] else []
-    } for r in data]
+    } for r in rows]
 
 def find_cat_row(cid):  cell = ws_cats.find(str(cid), in_column=1);  return cell.row if cell else None
 def find_item_row(uid): cell = ws_items.find(str(uid), in_column=1); return cell.row if cell else None
@@ -132,8 +144,8 @@ app = Flask(__name__)
 
 @app.route('/repair')
 def repair():
-    clear_blank_rows(sheet.worksheet("items"))
-    clear_blank_rows(sheet.worksheet("categories"))
+    repair(sheet.worksheet("items"))
+    repair(sheet.worksheet("categories"))
     return jsonify(success=True, message='Blank rows cleared')
 
 @app.route('/')

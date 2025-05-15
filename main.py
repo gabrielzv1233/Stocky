@@ -160,25 +160,26 @@ def repair():
 
 @app.route('/')
 def explorer():
-    cid = request.args.get('cat',type=int)
+    cid = request.args.get('cat', type=int)
     cats, items = read_categories(), read_items()
-    if cid:
-        subcats   =[c for c in cats if c['parent_id']==cid]
-        its       =[i for i in items if i['category_id']==cid]
-        bc_html   = build_breadcrumb_html(cid,cats)
-        parent_id = next((c['parent_id'] for c in cats if c['id']==cid),None)
-        parentPath= build_breadcrumb_str(parent_id,cats) if parent_id else '/'
+
+    if cid is not None:
+        subcats   = [c for c in cats if c['parent_id'] == cid]
+        its       = [i for i in items if i['category_id'] == cid]
+        bc_html   = build_breadcrumb_html(cid, cats)
+        parent_id = next((c['parent_id'] for c in cats if c['id'] == cid), None)
+        parentPath= build_breadcrumb_str(parent_id, cats) if parent_id is not None else '/'
     else:
-        subcats   =[c for c in cats if c['parent_id'] is None]
-        its       =[i for i in items if i['category_id'] is None]
+        subcats   = [c for c in cats if c['parent_id'] is None]
+        its       = [i for i in items if i['category_id'] == 0 or i['category_id'] is None]
         bc_html, parent_id, parentPath = '<b>/</b>', None, None
 
     return render_template_string(EXPLORER_HTML,
-            category={'id':cid,'parent_id':parent_id},
-            subcategories=subcats, items=its,
-            breadcrumb=bc_html, parentPath=parentPath,
-            build_breadcrumb_str=build_breadcrumb_str,
-            read_categories=read_categories)
+        category={'id': cid, 'parent_id': parent_id},
+        subcategories=subcats, items=its,
+        breadcrumb=bc_html, parentPath=parentPath,
+        build_breadcrumb_str=build_breadcrumb_str,
+        read_categories=read_categories)
 
 @app.route('/api/items_index')
 def items_index():

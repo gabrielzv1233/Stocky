@@ -68,14 +68,15 @@ def read_categories():
     } for r in ws_cats.get_all_records()]
 
 def read_items():
+    data = sheet.worksheet("items").get_all_records()
     return [{
         'uid':         str(r['uid']),
         'name':        r['name'],
-        'count':       int(r['count']),
+        'count':       int(r['count']) if r['count'] != '' else 0,
         'timestamp':   int(r['timestamp']),
-        'category_id': int(r['category_id']) if r['category_id'] not in ('',None) else None,
+        'category_id': int(r['category_id']),
         'image_paths': json.loads(r['image_paths']) if r['image_paths'] else []
-    } for r in ws_items.get_all_records()]
+    } for r in data]
 
 def find_cat_row(cid):  cell = ws_cats.find(str(cid), in_column=1);  return cell.row if cell else None
 def find_item_row(uid): cell = ws_items.find(str(uid), in_column=1); return cell.row if cell else None

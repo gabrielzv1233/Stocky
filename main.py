@@ -47,24 +47,32 @@ gc     = gspread.authorize(creds)
 sheet  = gc.open_by_key(SPREADSHEET_ID)
 drive  = build('drive', 'v3', credentials=creds)
 
-def repair(ws_items):
-    all_values = ws_items.get_all_values()
-
+def clear_blank_rows(worksheet):
+    all_values = worksheet.get_all_values()
     for i in range(len(all_values), 0, -1):
         row = all_values[i - 1]
-
         if not any(cell.strip() for cell in row):
-            ws_items.delete_rows(i)
-            continue
-
-        if i == 1:
-            continue
-
+            worksheet.delete_rows(i)
+            
+def repair_items_parent_id():
+    ws_items = sheet.worksheet(ITEMS_SHEET)
+    all_values = ws_items.get_all_values()
+    for i in range(2, len(all_values) + 1):
+        row = all_values[i - 1]
         if len(row) >= 5:
             cat_id = row[4].strip()
             if not cat_id.isdigit():
-                row[4] = '0'
                 ws_items.update_cell(i, 5, '0')
+
+def repair_categories_parent_id():
+    ws_cats = sheet.worksheet(CATEGORIES_SHEET)
+    all_values = ws_cats.get_all_values()
+    for i in range(2, len(all_values) + 1):
+        row = all_values[i - 1]
+        if len(row) >= 3:
+            parent_id = row[2].strip()
+            if parent_id and not parent_id.isdigit():
+                ws_cats.update_cell(i, 3, '')
 
 def get_or_create_ws(title, headers):
     try:
@@ -144,9 +152,11 @@ app = Flask(__name__)
 
 @app.route('/repair')
 def repair():
-    repair(sheet.worksheet("items"))
-    repair(sheet.worksheet("categories"))
-    return jsonify(success=True, message='Blank rows cleared')
+    clear_blank_rows(sheet.worksheet("items"))
+    clear_blank_rows(sheet.worksheet("categories"))
+    repair_categories_parent_id()
+    repair_items_parent_id()
+    return jsonify(success=True, message='(Possibly) repaired empty rows and parent IDs')
 
 @app.route('/')
 def explorer():

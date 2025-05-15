@@ -98,13 +98,13 @@ def read_categories():
 
 def read_items():
     raw = sheet.worksheet("items").get_all_records()
-    rows = [r for r in raw if any(cell.strip() for cell in r.values())]
+    rows = [r for r in raw if any(str(cell).strip() for cell in r.values())]
     return [{
         'uid':         str(r['uid']),
         'name':        r['name'],
-        'count':       int(r['count']) if r['count'] != '' else 0,
-        'timestamp':   int(r['timestamp']),
-        'category_id': int(r['category_id']) if str(r['category_id']).strip().isdigit() else 0,
+        'count':       int(r['count']) if str(r['count']).strip() else 0,
+        'timestamp':   int(r['timestamp']) if str(r['timestamp']).strip() else 0,
+        'category_id': int(r['category_id']) if str(r['category_id']).strip() else 0,
         'image_paths': json.loads(r['image_paths']) if r['image_paths'] else []
     } for r in rows]
 
@@ -193,7 +193,6 @@ def items_index():
                     'path':build_breadcrumb_str(i['category_id'],cats)+i['name']})
     return jsonify(idx)
 
-
 @app.route('/api/get_path')
 def get_path():
     t = request.args.get('type'); id_=request.args.get('id')
@@ -207,7 +206,6 @@ def get_path():
         if not i: return jsonify(success=False,message='Item not found')
         return jsonify(success=True,path=build_breadcrumb_str(i['category_id'],cats))
     return jsonify(success=False,message='Invalid type')
-
 
 @app.route('/api/new_category',methods=['POST'])
 def new_category():

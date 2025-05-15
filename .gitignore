@@ -3,3 +3,4 @@ instance/
 static/uploads/
 qr/
 *.xlsx
+creds.json

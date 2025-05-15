@@ -1,868 +1,508 @@
-from flask import Flask, request, jsonify, render_template_string, redirect, url_for, send_file
-from flask_sqlalchemy import SQLAlchemy
+from flask import Flask, request, jsonify, render_template_string, send_file
+import logging, time, json, random, re, uuid, os, base64
+from google.oauth2.service_account import Credentials
+from googleapiclient.http import MediaIoBaseUpload
+from googleapiclient.discovery import build
 from sympy import sympify
-from math import ceil 
+from io import BytesIO
 from PIL import Image
-import posixpath
-import random
-import time
-import json
-import uuid
-import os
-import re
+from math import ceil
+import gspread
 
-app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///stock.db'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-db = SQLAlchemy(app)
+creds_data = base64.b64decode(os.environ['GOOGLE_CREDS']).decode() # Download creds JSON from Google Cloud Console and base64 encode it
 
-# ----------------- Models -----------------
-class Category(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(100))
-    parent_id = db.Column(db.Integer, db.ForeignKey('category.id'), nullable=True)
-    children = db.relationship("Category", backref=db.backref('parent', remote_side=[id]), lazy=True)
-    items = db.relationship("Item", backref='category', lazy=True)
+# Leave anything below this line alone unless you know what you're doing
 
-class Item(db.Model):
-    uid = db.Column(db.String(10), primary_key=True)
-    name = db.Column(db.String(100))
-    count = db.Column(db.Integer)
-    timestamp = db.Column(db.Integer)
-    category_id = db.Column(db.Integer, db.ForeignKey('category.id'), nullable=True)
-    image_paths = db.Column(db.Text)  # JSON-encoded list of image URLs (e.g. ["/static/uploads/abc123_1.webp", ...])
+def extract_google_id(url: str) -> str:
+    match = re.search(r'/d/([a-zA-Z0-9_-]+)', url) or \
+            re.search(r'/folders/([a-zA-Z0-9_-]+)', url)
+    if not match:
+        raise ValueError(f"Could not extract ID from: {url}")
+    return match.group(1)
 
-with app.app_context():
-    db.create_all()
+SPREADSHEET_ID   = extract_google_id(os.environ['GOOGLE_SHEET_URL'])
+IMAGE_FOLDER_ID  = extract_google_id(os.environ['GOOGLE_FOLDER_URL'])
+CATEGORIES_SHEET = 'categories'
+ITEMS_SHEET      = 'items'
+SCOPES = [
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/drive'
+]
 
-# ----------------- Utilities -----------------
-def generate_uid():
-    return "".join(str(random.randint(0, 9)) for i in range(10))
+# Clear/create the uploads directory used for thumbnail cashe
 
-def enforce_name(name):
-    trimmed = name.strip()
-    if not re.match(r'^[A-Za-z0-9 _\-,.]+$', trimmed):
-        return None
-    return trimmed
+if os.path.exists("static/uploads"):
+    for filename in os.listdir("static/uploads"):
+        file_path = os.path.join("static/uploads", filename)
+        if os.path.isfile(file_path):
+            os.remove(file_path)
+else:
+    os.makedirs("static/uploads")
 
-def build_breadcrumb(category):
-    parts = []
-    current = category
-    while current:
-        parts.append(current.name)
-        current = current.parent
-    parts.reverse()
-    return "/" + "/".join(parts) if parts else "/"
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(message)s')
+logger = logging.getLogger(__name__)
+creds_json = json.loads(creds_data)
+creds = Credentials.from_service_account_info(creds_json, scopes=SCOPES)
+gc     = gspread.authorize(creds)
+sheet  = gc.open_by_key(SPREADSHEET_ID)
+drive  = build('drive', 'v3', credentials=creds)
 
-def build_breadcrumb_disp(category):
-    parts = []
-    current = category
-    while current:
-        parts.append(current.name)
-        current = current.parent
-    parts.reverse()
-    return "<b>/</b>" + "<b> / </b>".join(parts) if parts else "<b>/</b>"
+def get_or_create_ws(title, headers):
+    try:
+        ws = sheet.worksheet(title)
+        logger.debug(f"Found worksheet '{title}'")
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet(title=title, rows='1000', cols=str(len(headers)))
+        ws.append_row(headers)
+        logger.debug(f"Created worksheet '{title}'")
+    return ws
 
-def resolve_path(current_path, input_path):
-    if input_path.startswith("/"):
-        abs_path = input_path
-    else:
-        abs_path = posixpath.join(current_path, input_path)
-    return posixpath.normpath(abs_path) + "/"  if abs_path != "/" else "/"
+ws_cats = get_or_create_ws(CATEGORIES_SHEET, ['id','name','parent_id'])
+ws_items = get_or_create_ws(ITEMS_SHEET,     ['uid','name','count','timestamp','category_id','image_paths'])
 
-def duplicate_exists(target_category, name, is_category, exclude_id=None):
-    name_lower = name.lower()
+def read_categories():
+    return [{
+        'id':        int(r['id']),
+        'name':      r['name'],
+        'parent_id': int(r['parent_id']) if r['parent_id'] not in ('',None) else None
+    } for r in ws_cats.get_all_records()]
+
+def read_items():
+    return [{
+        'uid':         str(r['uid']),
+        'name':        r['name'],
+        'count':       int(r['count']),
+        'timestamp':   int(r['timestamp']),
+        'category_id': int(r['category_id']) if r['category_id'] not in ('',None) else None,
+        'image_paths': json.loads(r['image_paths']) if r['image_paths'] else []
+    } for r in ws_items.get_all_records()]
+
+def find_cat_row(cid):  cell = ws_cats.find(str(cid), in_column=1);  return cell.row if cell else None
+def find_item_row(uid): cell = ws_items.find(str(uid), in_column=1); return cell.row if cell else None
+
+def append_category(name, parent_id):
+    new_id = max([c['id'] for c in read_categories()] or [0]) + 1
+    ws_cats.append_row([new_id, name, parent_id or '']); return new_id
+
+def append_item(name, category_id):
+    uid = ''.join(str(random.randint(0,9)) for _ in range(10))
+    ws_items.append_row([uid, name, 0, int(time.time()), category_id or '', ''])
+    return uid
+
+def update_item_row(uid, name, count):
+    row = find_item_row(uid); ts=int(time.time())
+    ws_items.update(f'B{row}:D{row}', [[name, count, ts]])
+
+def duplicate_exists(target_cat_id, name, is_category, exclude=None):
+    name_l = name.lower()
     if is_category:
-        query = Category.query.filter(db.func.lower(Category.name)==name_lower)
-        if target_category:
-            query = query.filter(Category.parent_id==target_category.id)
-        else:
-            query = query.filter(Category.parent_id==None)
-        if exclude_id:
-            query = query.filter(Category.id != exclude_id)
-        return query.first() is not None
+        for c in read_categories():
+            if c['parent_id']==target_cat_id and c['name'].lower()==name_l and c['id']!=exclude:
+                return True
     else:
-        query = Item.query.filter(db.func.lower(Item.name)==name_lower)
-        if target_category:
-            query = query.filter(Item.category_id==target_category.id)
-        else:
-            query = query.filter(Item.category_id==None)
-        if exclude_id:
-            query = query.filter(Item.uid != exclude_id)
-        return query.first() is not None
-
-# ----------------- Explorer (File Browser) -----------------
-@app.route('/')
-def explorer():
-    cat_id = request.args.get('cat')
-    if cat_id:
-        category = Category.query.filter_by(id=cat_id).first()
-        if not category:
-            return redirect(url_for('explorer'))
-        subcategories = Category.query.filter_by(parent_id=category.id).order_by(Category.name).all()
-        items = Item.query.filter_by(category_id=category.id).order_by(Item.name).all()
-        breadcrumb = build_breadcrumb_disp(category)
-        parentPath = build_breadcrumb(category.parent) if category.parent else "/"
-    else:
-        category = None
-        subcategories = Category.query.filter_by(parent_id=None).order_by(Category.name).all()
-        items = Item.query.filter_by(category_id=None).order_by(Item.name).all()
-        breadcrumb = "<b>/</b>"
-        parentPath = None
-
-    return render_template_string("""
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>Stocky</title>
-    <style>
-        body { background-color: #2c2c2c; color: #f0f0f0; font-family: Arial, sans-serif; margin: 0; }
-        .explorer { padding: 20px; }
-        .header { display: flex; flex-direction: column; gap: 5px; width: 100%; }
-        .breadcrumb { padding-bottom: 10px; font-size: 14px; }
-        .controls { display: flex; justify-content: space-between; align-items: center; width: 100%; }
-        .buttons button { padding: 5px 10px; margin-right: 3px; background-color: #ffffff; color: #000; border: solid 1.5px black; border-radius: 7px; cursor: pointer; }
-        .list { margin-top: 20px; }
-        .folder, .item { padding: 10px; border: 1px solid #444; margin-bottom: 5px; cursor: pointer; }
-        .folder:hover, .item:hover { background-color: #444; }
-        .selected { border: 2px solid #007bff; }
-        .back-folder { background-color: #333; }
-        .empty-message { text-align: left; padding-bottom: 20px; font-size: 14px; color: #888; }
-    </style>
-    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-</head>
-<body>
-    <div class="explorer">
-        <div class="header">
-            <span class="breadcrumb">{{ breadcrumb | safe }}</span>
-            <div class="controls">
-                <div class="buttons">
-                    <button onclick="newSubCategory()">New Sub Category</button><button onclick="newItem()">New Item</button><button onclick="deleteSelected()">Delete</button>
-                </div>
-            </div>
-        </div>
-        <div class="list" id="listContainer">
-            {% if category %}
-                <div class="folder back-folder" data-path="{{ parentPath }}" draggable="true"
-                    ondblclick="goBack()"
-                    ondragstart="dragStart(event, this)" ondragover="allowDrop(event)" ondrop="drop(event, this)">
-                    ⬅️ ...
-                </div>
-            {% endif %}
-            {% for cat in subcategories %}
-                <div class="folder" data-id="{{ cat.id }}" data-path="{{ build_breadcrumb(cat) }}" draggable="true" 
-                     ondragstart="dragStart(event, this)" ondragover="allowDrop(event)" ondrop="drop(event, this)" 
-                     onclick="selectItem(this, 'category', '{{ cat.id }}')" ondblclick="openFolder({{ cat.id }})">
-                    📁 {{ cat.name }}
-                </div>
-            {% endfor %}
-            {% for item in items %}
-                <div class="item" data-uid="{{ item.uid }}" draggable="true" 
-                     ondragstart="dragStart(event, this)" onclick="selectItem(this, 'item', '{{ item.uid }}')" 
-                     ondblclick="openItem('{{ item.uid }}')">
-                    📄 {{ item.name }} ({{ item.count }})
-                </div>
-            {% endfor %}
-            {% if not subcategories and not items %}
-                <div class="empty-message">
-                    📂 This folder is empty.
-                </div>
-            {% endif %}
-        </div>
-    </div>
-<script>
-    // Navigation functions
-    function goBack() {
-        let parentId = "{{ category.parent_id if category and category.parent_id else '' }}";
-        if (parentId) {
-            location.href = "/?cat=" + parentId;
-        } else {
-            location.href = "/";
-        }
-    }
-    // Global selected element variable
-    let selected = null; // { type: 'item' or 'category', id: '...' }
-    function selectItem(element, type, id) {
-        document.querySelectorAll('.selected').forEach(el => el.classList.remove('selected'));
-        element.classList.add('selected');
-        selected = {type: type, id: id};
-    }
-    function openFolder(id) { location.href = "/?cat=" + id; }
-    function openItem(uid) {
-        let params = new URLSearchParams(window.location.search);
-        location.href = "/edit/" + uid + "?" + params.toString();
-    }
-    function newSubCategory() {
-        let name = prompt("Enter sub category name:").trim();
-        if(name) {
-            let valid = enforceNameJS(name);
-            if(!valid) { alert("Invalid name. Only letters, spaces, underscores, and dashes allowed."); return; }
-            let parent_id = "{{ category.id if category else '' }}";
-            $.post("/api/new_category", { name: name, parent_id: parent_id }, function(data){
-                if(data.success===false){ alert(data.message); } else { location.reload(); }
-            });
-        }
-    }
-    function newItem() {
-        let name = prompt("Enter item name:").trim();
-        if(name) {
-            let valid = enforceNameJS(name);
-            if(!valid) { alert("Invalid name. Only letters, spaces, underscores, and dashes allowed."); return; }
-            let parent_id = "{{ category.id if category else '' }}";
-            $.post("/api/new_item", { name: name, category_id: parent_id }, function(data){
-                if(data.success===false){ alert(data.message); }
-                else { location.href = "/edit/" + data.uid + (location.search ? location.search : ""); }
-            });
-        }
-    }
-    // Simple JS version of enforceName for client-side checking
-    function enforceNameJS(name) {
-        let pattern = /^[A-Za-z0-9 _\-,.]+$/;
-        return pattern.test(name);
-    }
-    // Drag & Drop functions
-    function dragStart(e, el) {
-        let type = el.classList.contains("folder") ? "category" : "item";
-        let id = type === "category" ? el.getAttribute("data-id") : el.getAttribute("data-uid");
-        e.dataTransfer.setData("application/json", JSON.stringify({ type: type, id: id }));
-    }
-    function allowDrop(e) { e.preventDefault(); }
-    function drop(e, target) {
-        e.preventDefault();
-        let data = e.dataTransfer.getData("application/json");
-        if (!data) return;
-        let obj = JSON.parse(data);
-        let targetPath = target.getAttribute("data-path");
-        if (!targetPath) { alert("Invalid drop target."); return; }
-        // Use the target folder's absolute path for the move.
-        $.post("/api/move", { type: obj.type, id: obj.id, path: targetPath }, function(data) {
-            if (!data.success) { alert(data.message); } else { location.reload(); }
-        });
-    }
-
-    function deleteSelected() {
-        if (!selected) { alert("Please select an item or category first."); return; }
-        if (confirm("Are you sure you want to delete the selected " + selected.type + "?")) {
-            $.post("/api/delete", { type: selected.type, id: selected.id }, function(data) {
-                if (!data.success) { alert(data.message); } else { location.reload(); }
-            });
-        }
-    }
-</script>
-</body>
-</html>
-    """, category=category, subcategories=subcategories, items=items, breadcrumb=breadcrumb, parentPath=parentPath, build_breadcrumb=build_breadcrumb)
-
-# ----------------- API Endpoints -----------------
-@app.route('/api/items_index')
-def items_index():
-    categories = Category.query.all()
-    items = Item.query.all()
-    index = []
-
-    for cat in categories:
-        index.append({
-            "type": "category",
-            "id": cat.id,
-            "name": cat.name.lower(),
-            "count": 0,
-            "path": build_breadcrumb(cat) + "/"
-        })
-
-    for item in items:
-        index.append({
-            "type": "item",
-            "uid": item.uid,
-            "name": item.name.lower(),
-            "count": item.count,
-            "path": (build_breadcrumb(item.category) if item.category else "/") + item.name
-        })
-
-    return jsonify(index)
-
-@app.route('/api/get_path', methods=['GET'])
-def get_path():
-    type_ = request.args.get('type')
-    id_ = request.args.get('id')
-    if type_ == 'category':
-        category = Category.query.filter_by(id=id_).first()
-        if not category:
-            return jsonify({"message": "Category not found.", "success": False})
-        path = build_breadcrumb(category)
-    elif type_ == 'item':
-        item = Item.query.filter_by(uid=id_).first()
-        if not item:
-            return jsonify({"message": "Item not found.", "success": False})
-        path = (build_breadcrumb(item.category) if item.category else "/")
-    else:
-        return jsonify({"message": "Invalid type.", "success": False})
-    return jsonify({"path": path, "success": True})
-
-@app.route('/api/new_item', methods=['POST'])
-def new_item():
-    name = request.form.get('name')
-    name = enforce_name(name) if name else None
-    if not name:
-        return jsonify({"message": "Invalid item name.", "success": False})
-    category_id = request.form.get('category_id')
-    if category_id == '':
-        category_id = None
-    if duplicate_exists(Category.query.get(category_id) if category_id else None, name, is_category=False):
-        return jsonify({"message": "Item with that name already exists.", "success": False})
-    uid = generate_uid()
-    timestamp = int(time.time())
-    item = Item(uid=uid, name=name, count=0, timestamp=timestamp, category_id=category_id)
-    db.session.add(item)
-    db.session.commit()
-    return jsonify({"message": "Created", "uid": uid, "success": True})
-
-@app.route('/api/new_category', methods=['POST'])
-def new_category():
-    name = request.form.get('name')
-    name = enforce_name(name) if name else None
-    if not name:
-        return jsonify({"message": "Invalid category name.", "success": False})
-    parent_id = request.form.get('parent_id')
-    if parent_id == '':
-        parent_id = None
-    if duplicate_exists(Category.query.get(parent_id) if parent_id else None, name, is_category=True):
-        return jsonify({"message": "Category with that name already exists.", "success": False})
-    cat = Category(name=name, parent_id=parent_id)
-    db.session.add(cat)
-    db.session.commit()
-    return jsonify({"message": "Category created", "id": cat.id, "success": True})
-
-@app.route('/api/move', methods=['POST'])
-def move():
-    type_ = request.form.get('type')
-    id_ = request.form.get('id')
-    input_path = request.form.get('path').strip()
-
-    if not input_path:
-        return jsonify({"message": "No path provided.", "success": False})
-
-    input_path = posixpath.normpath(input_path)
-    if not input_path.startswith("/"):
-        return jsonify({"message": "Invalid path. Must be absolute and start with '/'", "success": False})
-
-    abs_path = input_path.rstrip("/") if input_path != "/" else "/"
-
-    print(f"Attempting to move {type_} {id_} to {abs_path}")
-
-    target_category = None if abs_path == "/" else None
-    if abs_path != "/":
-        path_parts = [p for p in abs_path.split("/") if p]
-        current = None
-
-        for part in path_parts:
-            found = Category.query.filter(db.func.lower(Category.name) == part.lower(), Category.parent_id == (current.id if current else None)).first()
-            if not found:
-                return jsonify({"message": f"Path not found: {abs_path}", "success": False})
-            current = found
-
-        target_category = current
-
-    if type_ == "category":
-        category = Category.query.filter_by(id=id_).first()
-        if not category:
-            return jsonify({"message": "Category not found.", "success": False})
-
-        cur = target_category
-        while cur:
-            if cur.id == category.id:
-                return jsonify({"message": "Cannot move a category into itself or its descendant.", "success": False})
-            cur = cur.parent
-
-        if (category.parent_id or None) == (target_category.id if target_category else None):
-            return jsonify({"message": "Category already in this location.", "success": True})
-
-        if duplicate_exists(target_category, category.name, is_category=True, exclude_id=category.id):
-            return jsonify({"message": "A category with that name already exists at the target location.", "success": False})
-
-        category.parent_id = target_category.id if target_category else None
-
-    elif type_ == "item":
-        item = Item.query.filter_by(uid=id_).first()
-        if not item:
-            return jsonify({"message": "Item not found.", "success": False})
-
-        if (item.category_id or None) == (target_category.id if target_category else None):
-            return jsonify({"message": "Item already in this location.", "success": True})
-
-        if duplicate_exists(target_category, item.name, is_category=False, exclude_id=item.uid):
-            return jsonify({"message": "An item with that name already exists at the target location.", "success": False})
-
-        item.category_id = target_category.id if target_category else None
-
-    else:
-        return jsonify({"message": "Invalid type.", "success": False})
-
-    db.session.commit()
-    return jsonify({"message": "Move successful.", "success": True})
-
-def category_has_items(cat):
-    if cat.items:
-        return True
-    for child in cat.children:
-        if category_has_items(child):
-            return True
+        for i in read_items():
+            if i['category_id']==target_cat_id and i['name'].lower()==name_l and i['uid']!=exclude:
+                return True
     return False
 
-@app.route('/api/delete', methods=['POST'])
-def delete():
-    type_ = request.form.get('type')
-    id_ = request.form.get('id')
-    if type_ == 'item':
-        item = Item.query.filter_by(uid=id_).first()
-        if item:
-            db.session.delete(item)
-            db.session.commit()
-            return jsonify({"message": "Item deleted", "success": True})
-        else:
-            return jsonify({"message": "Item not found", "success": False})
-    elif type_ == 'category':
-        cat = Category.query.filter_by(id=id_).first()
-        if cat:
-            if category_has_items(cat):
-                return jsonify({"message": "Cannot delete category: it contains files.", "success": False})
-            def delete_cat(c):
-                for child in c.children:
-                    delete_cat(child)
-                db.session.delete(c)
-            delete_cat(cat)
-            db.session.commit()
-            return jsonify({"message": "Category deleted", "success": True})
-        else:
-            return jsonify({"message": "Category not found", "success": False})
-    return jsonify({"message": "Invalid type", "success": False})
+def breadcrumb_parts(cat_id, cats):
+    out=[]
+    cur=cat_id
+    while cur:
+        c=next((x for x in cats if x['id']==cur),None)
+        if not c: break
+        out.append(c['name']); cur=c['parent_id']
+    return list(reversed(out))
 
-@app.route('/api/item/<uid>', methods=['GET', 'POST'])
-def item_api(uid):
-    item = Item.query.filter_by(uid=uid).first()
-    if request.method == 'GET':
-        if item:
-            return jsonify({
-                "uid": item.uid,
-                "name": item.name,
-                "count": item.count,
-                "timestamp": item.timestamp,
-                "category_id": item.category_id
-            })
-        else:
-            return jsonify({"message": "Item not found"}), 404
+def build_breadcrumb_str(cat_id,cats): return '/' + '/'.join(breadcrumb_parts(cat_id,cats)) if cat_id else '/'
+def build_breadcrumb_html(cat_id,cats): return '<b>/</b>' + '<b> / </b>'.join(breadcrumb_parts(cat_id,cats)) if cat_id else '<b>/</b>'
+
+app = Flask(__name__)
+
+@app.route('/')
+def explorer():
+    cid = request.args.get('cat',type=int)
+    cats, items = read_categories(), read_items()
+    if cid:
+        subcats   =[c for c in cats if c['parent_id']==cid]
+        its       =[i for i in items if i['category_id']==cid]
+        bc_html   = build_breadcrumb_html(cid,cats)
+        parent_id = next((c['parent_id'] for c in cats if c['id']==cid),None)
+        parentPath= build_breadcrumb_str(parent_id,cats) if parent_id else '/'
     else:
-        data = request.form
-        new_name = data.get('name').strip()
-        new_name = enforce_name(new_name)
-        if not new_name:
-            return jsonify({"message": "Invalid name.", "success": False})
-        current_cat = item.category
-        if duplicate_exists(current_cat, new_name, is_category=False, exclude_id=item.uid):
-            return jsonify({"message": "An item with that name already exists in this folder.", "success": False})
-        item.name = new_name
-        if re.search(r"\d", data.get('count')):
-            item.count = int(ceil(sympify(re.sub(r"[^0-9+\-*/(). ]", "", (data.get('count') or '')).strip() or '0').evalf()))
-        else:
-            item.count = item.count if item.count > 0 else 0
-        item.timestamp = int(time.time())
-        db.session.commit()
-        return jsonify({"message": "Item updated", "success": True})
+        subcats   =[c for c in cats if c['parent_id'] is None]
+        its       =[i for i in items if i['category_id'] is None]
+        bc_html, parent_id, parentPath = '<b>/</b>', None, None
+
+    return render_template_string(EXPLORER_HTML,
+            category={'id':cid,'parent_id':parent_id},
+            subcategories=subcats, items=its,
+            breadcrumb=bc_html, parentPath=parentPath,
+            build_breadcrumb_str=build_breadcrumb_str,
+            read_categories=read_categories)
+
+@app.route('/api/items_index')
+def items_index():
+    cats, items = read_categories(), read_items()
+    idx=[]
+    for c in cats:
+        idx.append({'type':'category','id':c['id'],'name':c['name'].lower(),
+                    'count':0,'path':build_breadcrumb_str(c['id'],cats)+'/'})
+    for i in items:
+        idx.append({'type':'item','uid':i['uid'],'name':i['name'].lower(),
+                    'count':i['count'],
+                    'path':build_breadcrumb_str(i['category_id'],cats)+i['name']})
+    return jsonify(idx)
+
+
+@app.route('/api/get_path')
+def get_path():
+    t = request.args.get('type'); id_=request.args.get('id')
+    cats,items = read_categories(), read_items()
+    if t=='category':
+        c = next((x for x in cats if str(x['id'])==id_),None)
+        if not c: return jsonify(success=False,message='Category not found')
+        return jsonify(success=True,path=build_breadcrumb_str(c['id'],cats))
+    if t=='item':
+        i = next((x for x in items if x['uid']==id_),None)
+        if not i: return jsonify(success=False,message='Item not found')
+        return jsonify(success=True,path=build_breadcrumb_str(i['category_id'],cats))
+    return jsonify(success=False,message='Invalid type')
+
+
+@app.route('/api/new_category',methods=['POST'])
+def new_category():
+    name = request.form['name'].strip()
+    if not re.fullmatch(r'[A-Za-z0-9 _\-,.]+',name): return jsonify(success=False,message='Invalid')
+    parent_id = request.form.get('parent_id'); parent_id=int(parent_id) if parent_id else None
+    if duplicate_exists(parent_id,name,True):   return jsonify(success=False,message='Duplicate')
+    cid=append_category(name,parent_id)
+    return jsonify(success=True,id=cid,message='Created')
+
+@app.route('/api/new_item',methods=['POST'])
+def new_item():
+    name = request.form['name'].strip()
+    if not re.fullmatch(r'[A-Za-z0-9 _\-,.]+',name): return jsonify(success=False,message='Invalid')
+    category_id = request.form.get('category_id'); category_id=int(category_id) if category_id else None
+    if duplicate_exists(category_id,name,False): return jsonify(success=False,message='Duplicate')
+    uid = append_item(name,category_id)
+    return jsonify(success=True,uid=uid,message='Created')
+
+def resolve_target_category(abs_path,cats):
+    if abs_path=='/': return None
+    parts = [p for p in abs_path.strip('/').split('/') if p]
+    cur=None
+    for p in parts:
+        cur=next((c for c in cats if c['name'].lower()==p.lower() and c['parent_id']==(cur['id'] if cur else None)),None)
+        if not cur: return None
+    return cur
+
+@app.route('/api/move',methods=['POST'])
+def move():
+    t,id_,path = request.form['type'], request.form['id'], request.form['path'].strip()
+    if not path.startswith('/'): return jsonify(success=False,message='Path must start with /')
+    cats,items=read_categories(),read_items()
+    target_cat = resolve_target_category(path,cats)
+    target_id = target_cat['id'] if target_cat else None
+
+    if t=='category':
+        cat = next((c for c in cats if str(c['id'])==id_),None)
+        if not cat: return jsonify(success=False,message='Cat not found')
+
+        anc=target_cat
+        while anc:
+            if anc['id']==cat['id']: return jsonify(success=False,message='Cannot move into itself')
+            anc = next((c for c in cats if c['id']==anc['parent_id']),None)
+        if duplicate_exists(target_id,cat['name'],True,exclude=cat['id']):
+            return jsonify(success=False,message='Name exists in target')
+        row=find_cat_row(cat['id']); ws_cats.update_cell(row,3,target_id or '')
+        return jsonify(success=True,message='Moved')
+
+    if t=='item':
+        it = next((i for i in items if i['uid']==id_),None)
+        if not it: return jsonify(success=False,message='Item not found')
+        if duplicate_exists(target_id,it['name'],False,exclude=it['uid']):
+            return jsonify(success=False,message='Name exists in target')
+        row=find_item_row(it['uid']); ws_items.update_cell(row,5,target_id or '')
+        return jsonify(success=True,message='Moved')
+
+    return jsonify(success=False,message='Invalid type')
+
+@app.route('/api/delete',methods=['POST'])
+def delete():
+    t,id_ = request.form['type'],request.form['id']
+    if t=='item':
+        row=find_item_row(id_); ws_items.batch_clear([f"A{row}:F{row}"])
+        return jsonify(success=True,message='Item deleted')
+    if t=='category':
+        cats = read_categories()
+        if any(i for i in read_items() if i['category_id']==int(id_)):
+            return jsonify(success=False,message='Not empty')
+
+        to_delete=[int(id_)]
+        while True:
+            extra = [c['id'] for c in cats if c['parent_id'] in to_delete]
+            if not extra: break
+            to_delete.extend(extra)
+        for cid in to_delete:
+            row=find_cat_row(cid); ws_cats.batch_clear([f"A{row}:C{row}"])
+        return jsonify(success=True,message='Category deleted')
+    return jsonify(success=False,message='Invalid type')
+
+UPLOAD_DIR = os.path.join(app.root_path, 'static', 'uploads')
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 @app.route('/api/upload_image/<uid>', methods=['POST'])
 def upload_image(uid):
-    item = Item.query.filter_by(uid=uid).first()
-    if not item:
-        return jsonify({"message": "Item not found", "success": False}), 404
-
-    images = json.loads(item.image_paths) if item.image_paths else []
-    if len(images) >= 3:
-        return jsonify({"message": "Maximum images reached", "success": False}), 400
-
     if 'file' not in request.files:
-        return jsonify({"message": "No file provided", "success": False}), 400
-
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({"message": "No selected file", "success": False}), 400
-
-    try:
-        image = Image.open(file.stream).convert("RGBA")
-    except Exception as e:
-        return jsonify({"message": "Invalid image file", "success": False}), 400
-
-    upload_folder = os.path.join(app.root_path, 'static', 'uploads')
-    os.makedirs(upload_folder, exist_ok=True)
-
-    image_uid = uuid.uuid4().hex[:8]
-
-    # ===== Full image (downscale to max 1080px on any axis) =====
-    orig_w, orig_h = image.size
-    scale = min(1080 / orig_w, 1080 / orig_h, 1.0)
-    new_orig_size = (int(orig_w * scale), int(orig_h * scale))
-    full_image = image.resize(new_orig_size, Image.Resampling.LANCZOS)
-
-    full_filename = f"{uid}_{image_uid}_full.webp"
-    full_path = os.path.join(upload_folder, full_filename)
-    full_image.save(full_path, "WEBP")
-    full_url = f"/static/uploads/{full_filename}"
-
-    # ===== Thumbnail image (crop 128x128 centered) =====
-    thumb_scale = 128 / min(orig_w, orig_h)
-    thumb_w, thumb_h = int(orig_w * thumb_scale), int(orig_h * thumb_scale)
-    thumb_image = image.resize((thumb_w, thumb_h), Image.Resampling.LANCZOS)
-
-    left = (thumb_w - 128) // 2
-    top = (thumb_h - 128) // 2
-    thumb_image = thumb_image.crop((left, top, left + 128, top + 128))
-
-    thumb_filename = f"{uid}_{image_uid}_thumb.webp"
-    thumb_path = os.path.join(upload_folder, thumb_filename)
-    thumb_image.save(thumb_path, "WEBP")
-    thumb_url = f"/static/uploads/{thumb_filename}"
-
-    images.append({
-        "thumb": thumb_url,
-        "full": full_url
-    })
-    item.image_paths = json.dumps(images)
-    db.session.commit()
-
-    return jsonify({
-        "message": "Image uploaded",
-        "success": True,
-        "image_path": thumb_url,
-        "full_path": full_url
-    })
+        return jsonify(success=False, message='No file')
+    f = request.files['file']
+    raw = f.read()
+    stream = BytesIO(raw)
+    meta = {'name': f"{uid}_{uuid.uuid4().hex}", 'parents': [IMAGE_FOLDER_ID]}
+    media = MediaIoBaseUpload(stream, mimetype=f.mimetype or 'application/octet-stream', resumable=False)
+    fid = drive.files().create(body=meta, media_body=media, fields='id').execute()['id']
+    drive.permissions().create(fileId=fid, body={'role': 'reader', 'type': 'anyone'}).execute()
+    full_url = f"https://drive.usercontent.google.com/download?id={fid}&authuser=0"
+    img = Image.open(BytesIO(raw)).convert("RGBA")
+    thumb = img.resize((128, 128), Image.Resampling.LANCZOS)
+    thumb_name = f"{uid}_{uuid.uuid4().hex}_thumb.webp"
+    thumb_path = os.path.join(UPLOAD_DIR, thumb_name)
+    thumb.save(thumb_path, "WEBP")
+    thumb_url  = f"/static/uploads/{thumb_name}"
+    row = find_item_row(uid)
+    items = read_items()
+    imgs = next(i['image_paths'] for i in items if i['uid'] == uid)
+    imgs.append({"thumb": thumb_url, "full": full_url, "fid": fid})
+    ws_items.update_cell(row, 6, json.dumps(imgs))
+    return jsonify(success=True, image_path=thumb_url, full_path=full_url)
 
 @app.route('/api/delete_image/<uid>', methods=['POST'])
 def delete_image(uid):
-    item = Item.query.filter_by(uid=uid).first()
-    if not item:
-        return jsonify({"message": "Item not found", "success": False}), 404
-
-    thumb_to_delete = request.form.get('thumb')
-    if not thumb_to_delete:
-        return jsonify({"message": "Missing thumbnail path", "success": False}), 400
-
-    images = json.loads(item.image_paths) if item.image_paths else []
-    updated_images = []
-
-    deleted_thumb = None
-    deleted_full = None
-
-    for img in images:
-        if isinstance(img, str) and img == thumb_to_delete:
-            deleted_thumb = os.path.join(app.root_path, img.lstrip("/"))
-        elif isinstance(img, dict) and img.get("thumb") == thumb_to_delete:
-            deleted_thumb = os.path.join(app.root_path, img["thumb"].lstrip("/"))
-            deleted_full = os.path.join(app.root_path, img["full"].lstrip("/"))
-        else:
-            updated_images.append(img)
-
-    if not deleted_thumb or not os.path.exists(deleted_thumb):
-        return jsonify({"message": "Image not found", "success": False}), 404
+    thumb = request.form.get('thumb')
+    if not thumb:
+        return jsonify(success=False, message='No thumb')
+    
+    row = find_item_row(uid)
+    items = read_items()
+    item = next(i for i in items if i['uid'] == uid)
+    entry = next((e for e in item['image_paths'] if isinstance(e, dict) and e.get("thumb") == thumb), None)
+    if not entry:
+        return jsonify(success=False, message='Not found')
 
     try:
-        os.remove(deleted_thumb)
-        if deleted_full and os.path.exists(deleted_full):
-            os.remove(deleted_full)
-    except Exception as e:
-        return jsonify({"message": f"Failed to delete files: {str(e)}", "success": False}), 500
+        drive.files().delete(fileId=entry.get("fid")).execute()
+    except Exception:
+        pass
 
-    item.image_paths = json.dumps(updated_images)
-    db.session.commit()
-    return jsonify({"message": "Image deleted", "success": True})
+    local = os.path.join(app.root_path, thumb.lstrip('/'))
+    if os.path.exists(local):
+        os.remove(local)
 
-# ----------------- Export -----------------
-@app.route('/export')
-def export():
-    data = {}
-    cats = Category.query.all()
-    its = Item.query.all()
-    data['categories'] = [{"id": c.id, "name": c.name, "parent_id": c.parent_id} for c in cats]
-    data['items'] = [{"uid": i.uid, "name": i.name, "count": i.count, "timestamp": i.timestamp, "category_id": i.category_id} for i in its]
-    return app.response_class(
-        response=json.dumps(data, indent=4),
-        mimetype='application/json'
-    )
+    item['image_paths'].remove(entry)
+    ws_items.update_cell(row, 6, json.dumps(item['image_paths']))
 
-# ----------------- Item Editor -----------------
-@app.route('/view_image/<filename>')
-def view_image(filename):
-    path = os.path.join(app.root_path, 'static', 'uploads', filename)
-    if not os.path.exists(path):
-        return "Image not found", 404
-    return send_file(path, mimetype='image/webp', as_attachment=False)
+    return jsonify(success=True, message='Deleted')
 
 @app.route('/edit/<uid>')
 def edit(uid):
-    item = Item.query.filter_by(uid=uid).first()
-    if not item:
-        return "Item not found", 404
+    items, cats = read_items(), read_categories()
+    item = next((i for i in items if i['uid']==uid),None)
+    if not item: return "Item not found",404
+    parent = request.args.get('cat','')
+    breadcrumb=build_breadcrumb_html(item['category_id'],cats) if item['category_id'] else '<b>/</b>'
+    return render_template_string(EDITOR_HTML,item=item,images=item['image_paths'],
+                                  breadcrumb=breadcrumb,parent=parent)
 
-    parent_cat = request.args.get('cat', '')
-    images = json.loads(item.image_paths) if item.image_paths else []
+@app.route('/api/item/<uid>',methods=['POST'])
+def item_api(uid):
+    name = request.form['name'].strip()
+    count_raw = request.form['count']
+    if not re.fullmatch(r'[A-Za-z0-9 _\-,.]+',name): return jsonify(success=False,message='Invalid')
+    if not re.fullmatch(r'[0-9+\-*/(). ]*',count_raw): return jsonify(success=False,message='Invalid count')
+    count=int(ceil(sympify(re.sub(r'[^0-9+\-*/(). ]','',count_raw) or '0').evalf()))
+    update_item_row(uid,name,count)
+    return jsonify(success=True)
 
-    return render_template_string("""
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>Stocky - Edit Item</title>
-    <style>
-        body { background-color: #2c2c2c; color: #f0f0f0; font-family: Arial, sans-serif; padding: 20px; }
-        .editor { max-width: 600px; margin: auto; }
-        input { width: 100%; padding: 10px; margin-bottom: 10px; background-color: #444; border: 1px solid #666; color: #f0f0f0; }
-        .buttons { position: fixed; bottom: 20px; right: 20px; }
-        .buttons button { margin-left: 5px; padding: 10px 20px; }
-        .cancel { background: #fff; color: #888; border: 1px solid #888; }
-        .save { background: #007bff; color: #fff; border: none; }
-        .spancopy {
-            cursor: pointer;
-            font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
-            background-color: #424242;
-            color: #E7E7E7;
-            padding: 2px 5px;
-            border-radius: 4px;
-            font-size: 0.95em;
-            white-space: nowrap;
-        }
-        #imageUploadContainer { margin-top: 20px; }
-        #uploadWrapper { display: inline-block; width: 128px; height: 128px; cursor: pointer; }
-        #uploadWrapper img { width: 128px; height: 128px; }
-        #imageContainer { display: inline-block; margin-left: 10px; vertical-align: top; }
-        #imageContainer img { width: 128px; height: 128px; object-fit: cover; object-position: center; margin: 5px; cursor: pointer; }
-        #imageUploadContainer {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-        }
-        #uploadWrapper {
-            width: 128px;
-            height: 128px;
-            cursor: pointer;
-        }
-        #uploadWrapper img {
-            width: 100%;
-            height: 100%;
-        }
-        #imageContainer {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-        }
-        .uploaded-img {
-            width: 128px;
-            height: 128px;
-            object-fit: cover;
-            object-position: center;
-            cursor: pointer;
-        }
-        
-    </style>
-    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-</head>
-<body>
-    <div class="editor">
-        <h2>Editing item <code class="spancopy" onclick="copyid(event)">{{ item.uid }}</code>:</h2>
-        <input type="hidden" id="serverTimestamp" value="{{ item.timestamp }}">
-        <label>Name:</label>
-        <input type="text" id="name" value="{{ item.name }}">
-        <label>Count:</label>
-        <input pattern="[0-9+\-*/(). ]*" type="text" id="count" placeholder="{{ 0 if item.count <= 0 else item.count }}" value="{{ '' if item.count <= 0 else item.count }}">
+@app.route('/export')
+def export(): return jsonify(categories=read_categories(),items=read_items())
 
-        <div id="imageUploadContainer">
-            <div id="uploadWrapper">
-                <img id="uploadBtn" src="/static/upload_button.png" alt="Upload Image">
-                <input type="file" id="imageInput" accept="image/*" style="display:none">
-            </div>
-            <div id="imageContainer">
-                {% for img in images %}
-                    <img class="uploaded-img" src="{{ img.thumb }}" data-full="{{ img.full }}" alt="Uploaded Image">
-                {% endfor %}
-            </div>
-        </div>
-    </div>
-    <div class="buttons">
-        <button class="cancel" onclick="cancelEdit()">Cancel</button>
-        <button class="save" onclick="saveAndExit()">Save & Exit</button>
-    </div>
+@app.route('/view_image/<path:filename>')
+def view_image(filename):
+
+    p=os.path.join(app.root_path,'static','uploads',filename)
+    return send_file(p,mimetype='image/webp',as_attachment=False) if os.path.exists(p) else ('Not found',404)
+
+EXPLORER_HTML = """
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>Stocky</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+body{background:#2c2c2c;color:#f0f0f0;font-family:Arial,sans-serif;margin:0}
+.explorer{padding:20px}.header{display:flex;flex-direction:column;gap:5px}
+.breadcrumb{padding-bottom:10px;font-size:14px}
+.controls{display:flex;justify-content:space-between;align-items:center}
+.buttons button{padding:5px 10px;margin-right:3px;background:#fff;color:#000;border:1.5px solid #000;border-radius:7px;cursor:pointer}
+.list{margin-top:20px}.folder,.item{padding:10px;border:1px solid #444;margin-bottom:5px;cursor:pointer}
+.folder:hover,.item:hover{background:#444}.selected{border:2px solid #007bff}
+.back-folder{background:#333}.empty-message{color:#888;font-size:14px;padding-bottom:20px}
+</style><script src="https://code.jquery.com/jquery-3.6.0.min.js"></script></head>
+<body><div class="explorer">
+<div class="header"><span class="breadcrumb">{{breadcrumb|safe}}</span>
+<div class="controls"><div class="buttons">
+<button onclick="newSubCategory()">New Sub Category</button>
+<button onclick="newItem()">New Item</button>
+<button onclick="deleteSelected()">Delete</button>
+</div></div></div>
+<div class="list">
+{% if category.id %}
+  <div class="folder back-folder" ondblclick="goBack()">⬅️ ...</div>
+{% endif %}
+{% for cat in subcategories %}
+  <div class="folder" data-id="{{cat.id}}" onclick="selectItem(this,'category','{{cat.id}}')" ondblclick="openFolder({{cat.id}})">
+    📁 {{cat.name}}
+  </div>
+{% endfor %}
+{% for item in items %}
+  <div class="item" data-uid="{{item.uid}}" onclick="selectItem(this,'item','{{item.uid}}')" ondblclick="openItem('{{item.uid}}')">
+    📄 {{item.name}} ({{item.count}})
+  </div>
+{% endfor %}
+{% if not subcategories and not items %}
+  <div class="empty-message">📂 This folder is empty.</div>
+{% endif %}
+</div></div>
 <script>
-    document.addEventListener("DOMContentLoaded", function() {
-        document.querySelectorAll(".spancopy").forEach(span => {
-            span.setAttribute("title", "Click to copy");
-        });
-    });
-    function copyid(event) {
-        let span = event.target;
-        let originalText = span.innerText || span.textContent;
-        if (navigator.clipboard && window.isSecureContext) {
-            navigator.clipboard.writeText(originalText).then(() => {
-                span.innerText = "Copied!";
-                setTimeout(() => { span.innerText = originalText; }, 1000);
-            });
-        } else {
-            let textarea = document.createElement("textarea");
-            textarea.value = originalText;
-            document.body.appendChild(textarea);
-            textarea.select();
-            document.execCommand("copy");
-            span.innerText = "Copied!";
-            setTimeout(() => { span.innerText = originalText; }, 1000);
-            document.body.removeChild(textarea);
-        }
+let selected=null;
+function selectItem(el,t,id){document.querySelectorAll('.selected').forEach(x=>x.classList.remove('selected'));el.classList.add('selected');selected={type:t,id:id}}
+function goBack(){const pid='{{category.parent_id if category.id else ""}}';location.href=pid?"/?cat="+pid:"/"}
+function openFolder(id){location.href="/?cat="+id}
+function openItem(uid){const p=new URLSearchParams(location.search);const c=p.get('cat');location.href="/edit/"+uid+(c?"?cat="+c:"")}
+function newSubCategory(){const name=prompt("Enter sub category name:");if(!name)return;$.post("/api/new_category",{name,parent_id:'{{category.id if category.id else ""}}'}).done(d=>d.success?location.reload():alert(d.message))}
+function newItem(){const name=prompt("Enter item name:");if(!name)return;$.post("/api/new_item",{name,category_id:'{{category.id if category.id else ""}}'}).done(d=>d.success?location.reload():alert(d.message))}
+function deleteSelected(){if(!selected)return alert("Select something first.");if(!confirm("Delete "+selected.type+"?"))return;$.post("/api/delete",selected).done(d=>d.success?location.reload():alert(d.message))}
+</script></body></html>
+"""
+
+EDITOR_HTML = """
+<!DOCTYPE html><html><head><meta charset='utf-8'><title>Stocky – Edit</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+body{background:#2c2c2c;color:#f0f0f0;font-family:Arial,sans-serif;padding:20px}
+.editor{max-width:600px;margin:auto}
+input{width:100%;padding:10px;margin-bottom:10px;background:#444;border:1px solid #666;color:#f0f0f0}
+.buttons{position:fixed;bottom:20px;right:20px}.buttons button{margin-left:5px;padding:10px 20px}
+.cancel{background:#fff;color:#888;border:1px solid #888}.save{background:#007bff;color:#fff;border:none}
+.spancopy{cursor:pointer;font-family:monospace;background:#424242;color:#E7E7E7;padding:2px 5px;border-radius:4px}
+#imageUploadContainer,#imageContainer{display:flex;flex-wrap:wrap;gap:10px}
+#uploadWrapper{width:128px;height:128px;cursor:pointer}#uploadWrapper img{width:100%;height:100%}
+.uploaded-img{width:128px;height:128px;object-fit:cover;cursor:pointer}
+</style><script src='https://code.jquery.com/jquery-3.6.0.min.js'></script></head>
+<body>
+<div class='editor'>
+<h2>Editing item <code class='spancopy' onclick='copyid(event)'>{{ item.uid }}</code>:</h2>
+<label>Name:<input type='text' id='name' value='{{ item.name }}'></label>
+<label>Count:<input pattern='[0-9+\\-*/(). ]*' type='text' id='count' value='{{ item.count }}'></label>
+<div id='imageUploadContainer'>
+  <div id='uploadWrapper'>
+    <img id='uploadBtn' src='/static/upload_button.png'><input id='imageInput' type='file' accept='image/*' style='display:none'>
+  </div>
+  <div id='imageContainer'>
+    {% for url in images %}
+      {% if url is mapping %}
+        <img class='uploaded-img' src='{{ url.thumb }}' data-full='{{ url.full }}'>
+      {% else %}
+        <img class='uploaded-img' src='{{ url }}' data-full='{{ url }}'>
+      {% endif %}
+    {% endfor %}
+  </div>
+</div>
+</div>
+<div class='buttons'><button class='cancel' onclick='cancel()'>Cancel</button><button class='save' onclick='save()'>Save & Exit</button></div>
+<script>
+const uid    = "{{ item.uid }}";
+const parent = "{{ parent }}";
+const $btnImg = $("#uploadBtn");
+const UP_ICON    = "/static/upload_button.png";
+const LOADING_GIF= "/static/loading.gif";
+
+function copyid(e){
+  const s=e.target, t=s.textContent;
+  navigator.clipboard.writeText(t).then(()=>{
+    s.textContent="Copied!"; setTimeout(()=>s.textContent=t,1e3);
+  });
+}
+
+function toggleUploadButton(){
+  $("#uploadWrapper").toggle($("#imageContainer img").length < 3);
+}
+toggleUploadButton();
+
+function save(){
+  $.post("/api/item/"+uid,{name:$("#name").val(),count:$("#count").val()})
+    .done(d=> d.success ? location.href="/?cat="+parent : alert(d.message));
+}
+function cancel(){ location.href="/?cat="+parent }
+
+function spinner(on){
+  $btnImg.attr("src", on ? LOADING_GIF : UP_ICON);
+  $("#uploadWrapper").css("pointer-events", on ? "none" : "auto");
+}
+spinner(true);
+$(window).on("load", ()=> spinner(false));
+
+$("#uploadBtn").click(()=> $("#imageInput").click());
+$("#imageInput").on("change", e=>{
+  const f=e.target.files[0]; if(!f) return;
+  const fd=new FormData(); fd.append("file",f);
+
+  spinner(true);
+  $.ajax({
+    url:`/api/upload_image/${uid}`,
+    type:"POST",
+    data:fd,
+    processData:false,
+    contentType:false
+  }).done(d=>{
+    spinner(false);
+    if(d.success){
+      $("#imageContainer").append(
+        `<img class="uploaded-img" src="${d.image_path}" data-full="${d.full_path}">`
+      );
+      toggleUploadButton();
+      $("#imageInput").val("");
+    } else alert(d.message);
+  }).fail(()=> spinner(false));
+});
+
+$(document).on("click", ".uploaded-img", function(){
+  const img=this;
+
+  if(img.__timer){
+    clearTimeout(img.__timer); img.__timer=null;
+
+    if(confirm("Delete this image?")){
+      spinner(true);
+      const rel = img.src.startsWith(location.origin)
+                 ? img.src.slice(location.origin.length) : img.src;
+
+      $.post(`/api/delete_image/${uid}`, { thumb: rel })
+        .done(d=>{
+          spinner(false);
+          if(d.success){ $(img).remove(); toggleUploadButton(); }
+          else alert(d.message);
+        }).fail(()=> spinner(false));
     }
-
-    const uid = "{{ item.uid }}";
-    const autosaveKey = "autosave_" + uid;
-    const parentCat = "{{ parent_cat }}";
-
-    $(document).ready(function(){
-        let autosaveData = localStorage.getItem(autosaveKey);
-        if(autosaveData){
-            let data = JSON.parse(autosaveData);
-            let serverTs = parseInt($("#serverTimestamp").val());
-            if(data.timestamp > serverTs){
-                if(confirm("Found a local autosave that has not been pushed. Restore it?")){
-                    $("#name").val(data.name);
-                    $("#count").val(data.count);
-                } else {
-                    localStorage.removeItem(autosaveKey);
-                }
-            }
-        }
-
-        $("#uploadBtn").on("click", function() {
-            if ($("#imageContainer img").length >= 3) return;
-            $("#imageInput").click();
-        });
-
-        $("#imageInput").on("change", function(e) {
-            let file = e.target.files[0];
-            if(file) {
-                uploadImage(file);
-                $(this).val("");
-            }
-        });
-
-        $("#uploadWrapper").on("dragover", function(e) {
-            e.preventDefault();
-            $(this).css("border", "2px dashed #007bff");
-        });
-        $("#uploadWrapper").on("dragleave", function(e) {
-            e.preventDefault();
-            $(this).css("border", "none");
-        });
-        $("#uploadWrapper").on("drop", function(e) {
-            e.preventDefault();
-            $(this).css("border", "none");
-            let file = e.originalEvent.dataTransfer.files[0];
-            if(file) uploadImage(file);
-        });
-
-        attachImageClickHandlers();
-    });
-
-    function uploadImage(file) {
-        let formData = new FormData();
-        formData.append("file", file);
-        $.ajax({
-            url: "/api/upload_image/" + uid,
-            type: "POST",
-            data: formData,
-            processData: false,
-            contentType: false,
-            success: function(data) {
-                if(data.success) {
-                    let img = $("<img>", {
-                        src: data.image_path,
-                        "data-full": data.full_path,
-                        class: "uploaded-img",
-                        alt: "Uploaded Image"
-                    }).css({ width: "128px", height: "128px", "object-fit": "cover", "object-position": "center", margin: "5px", cursor: "pointer" });
-
-                    $("#imageContainer").append(img);
-                    attachImageClickHandlers();
-
-                    if($("#imageContainer img").length >= 3){
-                        $("#uploadWrapper").hide();
-                    }
-                } else {
-                    alert(data.message);
-                }
-            }
-        });
-    }
-
-    function attachImageClickHandlers(){
-        $(".uploaded-img").off("click").on("click", function(e) {
-            const $img = $(this);
-            if (this.clickTimeout) {
-                clearTimeout(this.clickTimeout);
-                this.clickTimeout = null;
-
-                if (confirm("Do you want to delete this image?")) {
-                    $.post("/api/delete_image/" + uid, {
-                        thumb: $img.attr("src")
-                    }, function(data) {
-                        if (data.success) {
-                            $img.remove();
-                            if ($("#imageContainer img").length < 3) {
-                                $("#uploadWrapper").show();
-                            }
-                        } else {
-                            alert(data.message);
-                        }
-                    });
-                }
-            } else {
-                this.clickTimeout = setTimeout(() => {
-                    this.clickTimeout = null;
-                    let fullPath = $img.attr("data-full").split("/").pop();
-                    window.open("/view_image/" + fullPath, "_blank");
-                }, 500);
-            }
-        });
-    }
-
-    function autosave(){
-        let data = {
-            name: $("#name").val(),
-            count: $("#count").val(),
-            timestamp: Date.now()
-        };
-        localStorage.setItem(autosaveKey, JSON.stringify(data));
-    }
-
-    setInterval(autosave, 15000);
-    $("input").on("blur", autosave);
-    $("#count").on("keydown", function(e){
-        let val = parseInt($(this).val());
-        if(isNaN(val)) val = 0;
-        if(e.key === "ArrowUp"){ $(this).val(val+1); e.preventDefault(); }
-        else if(e.key === "ArrowDown"){ $(this).val(val-1); e.preventDefault(); }
-    });
-
-    function saveItem(callback){
-        $.post("/api/item/" + uid, {
-            name: $("#name").val(),
-            count: $("#count").val(),
-        }, function(data){
-            if(data.success === false){ alert(data.message); }
-            localStorage.removeItem(autosaveKey);
-            if(callback) callback();
-        });
-    }
-
-    function saveAndExit(){ saveItem(function(){ window.location.href = "/?cat=" + parentCat; }); }
-    function cancelEdit(){ localStorage.removeItem(autosaveKey); window.location.href = "/?cat=" + parentCat; }
+  }else{
+    img.__timer=setTimeout(()=>{
+      img.__timer=null;
+      window.open($(img).data("full"), "_blank");
+    },300);
+  }
+});
 </script>
-</body>
-</html>
-    """, item=item, parent_cat=parent_cat, images=images)
+</body></html>
+"""
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+if __name__=='__main__':
+    logger.debug("Running on http://0.0.0.0:5000")
+    app.run(host='0.0.0.0',port=5000,debug=True)

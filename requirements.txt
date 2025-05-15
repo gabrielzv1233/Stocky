@@ -1,4 +1,8 @@
-flask
+Flask
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+google-api-python-client
+gspread
 sympy
-pillow
-flask_sqlalchemy==3.1.1
+Pillow

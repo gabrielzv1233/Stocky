@@ -14,8 +14,8 @@ creds_data = base64.b64decode(os.environ['GOOGLE_CREDS']).decode() # Download cr
 # Leave anything below this line alone unless you know what you're doing
 
 def extract_google_id(url: str) -> str:
-    match = re.search(r'/d/([a-zA-Z0-9_-]+)', url) or \
-            re.search(r'/folders/([a-zA-Z0-9_-]+)', url)
+    match = re.search(r'/folders/([a-zA-Z0-9_-]+)', url) or \
+            re.search(r'/d/([a-zA-Z0-9_-]+)', url)
     if not match:
         raise ValueError(f"Could not extract ID from: {url}")
     return match.group(1)

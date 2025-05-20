@@ -299,26 +299,49 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 def upload_image(uid):
     if 'file' not in request.files:
         return jsonify(success=False, message='No file')
+
     f = request.files['file']
     raw = f.read()
     stream = BytesIO(raw)
-    meta = {'name': f"{uid}_{uuid.uuid4().hex}", 'parents': [IMAGE_FOLDER_ID]}
-    media = MediaIoBaseUpload(stream, mimetype=f.mimetype or 'application/octet-stream', resumable=False)
-    fid = drive.files().create(body=meta, media_body=media, fields='id').execute()['id']
-    drive.permissions().create(fileId=fid, body={'role': 'reader', 'type': 'anyone'}).execute()
+
+    meta = {
+        'name': f"{uid}_{uuid.uuid4().hex}",
+        'parents': [IMAGE_FOLDER_ID]
+    }
+    media = MediaIoBaseUpload(stream,
+                              mimetype=f.mimetype or 'application/octet-stream',
+                              resumable=False)
+
+    fid = drive.files().create(
+        body=meta,
+        media_body=media,
+        fields='id',
+        supportsAllDrives=True
+    ).execute()['id']
+
+    drive.permissions().create(
+        fileId=fid,
+        body={'role': 'reader', 'type': 'anyone'},
+        supportsAllDrives=True
+    ).execute()
+
     full_url = f"https://drive.usercontent.google.com/download?id={fid}&authuser=0"
+
     img = Image.open(BytesIO(raw)).convert("RGBA")
     thumb = img.resize((128, 128), Image.Resampling.LANCZOS)
     thumb_name = f"{uid}_{uuid.uuid4().hex}_thumb.webp"
     thumb_path = os.path.join(UPLOAD_DIR, thumb_name)
     thumb.save(thumb_path, "WEBP")
-    thumb_url  = f"/static/uploads/{thumb_name}"
+    thumb_url = f"/static/uploads/{thumb_name}"
+
     row = find_item_row(uid)
     items = read_items()
     imgs = next(i['image_paths'] for i in items if i['uid'] == uid)
     imgs.append({"thumb": thumb_url, "full": full_url, "fid": fid})
     ws_items.update_cell(row, 6, json.dumps(imgs))
+
     return jsonify(success=True, image_path=thumb_url, full_path=full_url)
+
 
 @app.route('/api/delete_image/<uid>', methods=['POST'])
 def delete_image(uid):

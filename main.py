@@ -1,6 +1,7 @@
-from flask import Flask, request, jsonify, render_template_string, send_file
-import logging, time, json, random, re, uuid, os, base64, qrcode, gspread
+from flask import Flask, request, jsonify, render_template_string, send_file, url_for, session, redirect,  send_from_directory
+import logging, time, json, random, re, uuid, os, base64, qrcode, gspread, hashlib
 from google.oauth2.service_account import Credentials
+from authlib.integrations.flask_client import OAuth
 from googleapiclient.http import MediaIoBaseUpload
 from googleapiclient.discovery import build
 from PIL import Image, ImageOps
@@ -8,7 +9,10 @@ from sympy import sympify
 from io import BytesIO
 from math import ceil
 
-# load .env files, used for development
+app = Flask(__name__)
+app.secret_key = hashlib.sha256(os.environ.get("BASE_SECRET", base64.b64encode(os.urandom(24)).decode()).encode()).digest()
+
+# Load .env files, used for development
 for root, _, files in os.walk("."):
     for file in files:
         if file.endswith(".env"):
@@ -22,7 +26,20 @@ for root, _, files in os.walk("."):
                             value = value[1:-1]
                         os.environ[key] = value
 
+# Allowed gmail domains for app access
+ALLOWED_DOMAINS = os.environ.get('ALLOWED_DOMAINS', '').split(',')
+ALLOWED_EMAILS = os.environ.get('ALLOWED_EMAILS', '').split(',')
+
 creds_data = base64.b64decode(os.environ['GOOGLE_CREDS']).decode()
+
+oauth = OAuth(app)
+google = oauth.register(
+    name='google',
+    client_id=os.environ['GOOGLE_CLIENT_ID'],
+    client_secret=os.environ['GOOGLE_CLIENT_SECRET'],
+    server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+    client_kwargs={'scope': 'openid email'}
+)
 
 def extract_google_id(url: str) -> str:
     match = re.search(r'/folders/([a-zA-Z0-9_-]+)', url) or \
@@ -31,10 +48,10 @@ def extract_google_id(url: str) -> str:
         raise ValueError(f"Could not extract ID from: {url}")
     return match.group(1)
 
-SPREADSHEET_ID   = extract_google_id(os.environ['GOOGLE_SHEET_URL'])
+SPREADSHEET_ID = extract_google_id(os.environ['GOOGLE_SHEET_URL'])
 IMAGE_FOLDER_ID  = extract_google_id(os.environ['GOOGLE_FOLDER_URL'])
 CATEGORIES_SHEET = 'categories'
-ITEMS_SHEET      = 'items'
+ITEMS_SHEET = 'items'
 SCOPES = [
     'https://www.googleapis.com/auth/spreadsheets',
     'https://www.googleapis.com/auth/drive'
@@ -47,14 +64,13 @@ for folder in ["static/uploads", "static/qr"]:
         if os.path.isfile(fp):
             os.remove(fp)
 
-
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
 creds_json = json.loads(creds_data)
 creds = Credentials.from_service_account_info(creds_json, scopes=SCOPES)
-gc     = gspread.authorize(creds)
-sheet  = gc.open_by_key(SPREADSHEET_ID)
-drive  = build('drive', 'v3', credentials=creds)
+gc = gspread.authorize(creds)
+sheet = gc.open_by_key(SPREADSHEET_ID)
+drive = build('drive', 'v3', credentials=creds)
 
 def clear_blank_rows(worksheet):
     all_values = worksheet.get_all_values()
@@ -94,7 +110,7 @@ def get_or_create_ws(title, headers):
     return ws
 
 ws_cats = get_or_create_ws(CATEGORIES_SHEET, ['id','name','parent_id'])
-ws_items = get_or_create_ws(ITEMS_SHEET,     ['uid','name','count','timestamp','category_id','image_paths'])
+ws_items = get_or_create_ws(ITEMS_SHEET, ['uid','name','count','timestamp','category_id','image_paths'])
 
 def read_categories():
     data = ws_cats.get_all_records()
@@ -157,7 +173,48 @@ def breadcrumb_parts(cat_id, cats):
 def build_breadcrumb_str(cat_id,cats): return '/' + '/'.join(breadcrumb_parts(cat_id,cats)) if cat_id else '/'
 def build_breadcrumb_html(cat_id,cats): return '<b>/</b>' + '<b> / </b>'.join(breadcrumb_parts(cat_id,cats)) if cat_id else '<b>/</b>'
 
-app = Flask(__name__)
+ENABLE_AUTH_REQ = os.environ.get("ENABLE_AUTH_REQ", "False").lower() in ("1", "true", "yes")
+
+@app.before_request
+def require_login():
+    if not ENABLE_AUTH_REQ:
+        return
+
+    if request.endpoint in ('login', 'authorize', 'static', 'privacy', 'info'):
+        return
+
+    if 'email' not in session:
+        return redirect('/login')
+
+@app.route('/login')
+def login():
+    session.clear()
+    return google.authorize_redirect(url_for('authorize', _external=True))
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect('/')
+
+@app.route('/authorize')
+def authorize():
+    token = google.authorize_access_token()
+    user_info = google.get('https://openidconnect.googleapis.com/v1/userinfo').json()
+    email = user_info.get('email')
+
+    if not email or (
+        email not in ALLOWED_EMAILS and
+        not any(email.endswith(f"@{domain}") for domain in ALLOWED_DOMAINS)
+    ):
+        return """
+                <script>
+                  alert("You are not allowed to login with an email using that domain.");
+                  window.location.href = "/login";
+                </script>
+                """, 403
+
+    session['email'] = email
+    return redirect('/')
 
 @app.route("/api/qr/<b64url>")
 def gen_qr(b64url):

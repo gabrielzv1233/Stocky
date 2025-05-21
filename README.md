@@ -1,5 +1,9 @@
 # How to set up stocky
 
+> Supports Google Auth but I dont know how to explain it, defaults to False<br>
+> Auth uses the following env vars `ENABLE_AUTH_REQ`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `ALLOWED_DOMAINS`, and `ALLOWED_EMAILS`<br>
+> You can also use `BASE_SECRET` to define a static secret for your flask session, otherwise it will be random
+
 ### Step 1: Set up the project
 
 1. Go to [https://console.cloud.google.com](https://console.cloud.google.com) and create a project.

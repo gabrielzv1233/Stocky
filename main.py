@@ -1,13 +1,26 @@
 from flask import Flask, request, jsonify, render_template_string, send_file
-import logging, time, json, random, re, uuid, os, base64
+import logging, time, json, random, re, uuid, os, base64, qrcode, gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.http import MediaIoBaseUpload
 from googleapiclient.discovery import build
 from sympy import sympify
 from io import BytesIO
-from PIL import Image
 from math import ceil
-import gspread
+from PIL import Image
+
+# load .env files, used for development
+for root, _, files in os.walk("."):
+    for file in files:
+        if file.endswith(".env"):
+            print(f"Loading environment variables from {file}")
+            full_path = os.path.join(root, file)
+            with open(full_path) as f:
+                for line in f:
+                    if line.strip() and not line.startswith("#"):
+                        key, _, value = line.strip().partition("=")
+                        if value.startswith('"') and value.endswith('"'):
+                            value = value[1:-1]
+                        os.environ[key] = value
 
 creds_data = base64.b64decode(os.environ['GOOGLE_CREDS']).decode() # Download creds JSON from Google Cloud Console and base64 encode it
 
@@ -29,15 +42,13 @@ SCOPES = [
     'https://www.googleapis.com/auth/drive'
 ]
 
-# Clear/create the uploads directory used for thumbnail cashe
+for folder in ["static/uploads", "static/qr"]:
+    os.makedirs(folder, exist_ok=True)
+    for f in os.listdir(folder):
+        fp = os.path.join(folder, f)
+        if os.path.isfile(fp):
+            os.remove(fp)
 
-if os.path.exists("static/uploads"):
-    for filename in os.listdir("static/uploads"):
-        file_path = os.path.join("static/uploads", filename)
-        if os.path.isfile(file_path):
-            os.remove(file_path)
-else:
-    os.makedirs("static/uploads")
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
@@ -149,6 +160,21 @@ def build_breadcrumb_str(cat_id,cats): return '/' + '/'.join(breadcrumb_parts(ca
 def build_breadcrumb_html(cat_id,cats): return '<b>/</b>' + '<b> / </b>'.join(breadcrumb_parts(cat_id,cats)) if cat_id else '<b>/</b>'
 
 app = Flask(__name__)
+
+@app.route("/api/qr/<b64url>")
+def gen_qr(b64url):
+    safe_name = "".join(c for c in b64url if c.isalnum() or c in ('-', '_'))
+    filepath = os.path.join("static/qr", f"{safe_name}.png")
+
+    if not os.path.exists(filepath):
+        try:
+            padded = b64url + '=' * (-len(b64url) % 4)
+            url = base64.urlsafe_b64decode(padded).decode()
+            qrcode.make(url).save(filepath)
+        except Exception:
+            return "Invalid base64 input", 400
+
+    return send_file(filepath, mimetype="image/png")
 
 @app.route('/repair')
 def repair():
@@ -465,7 +491,7 @@ input{width:100%;padding:10px;margin-bottom:10px;background:#444;border:1px soli
 </style><script src='https://code.jquery.com/jquery-3.6.0.min.js'></script></head>
 <body>
 <div class='editor'>
-<h2>Editing item <code class='spancopy' onclick='copyid(event)'>{{ item.uid }}</code>:</h2>
+<h2>Editing item <code title="Generate QR code for this item" class='spancopy' onclick='genQR()'>{{ item.uid }}</code>:</h2>
 <label>Name:<input type='text' id='name' value='{{ item.name }}'></label>
 <label>Count:<input pattern='[0-9+\\-*/(). ]*' type='text' id='count' value='{{ item.count }}'></label>
 <div id='imageUploadContainer'>
@@ -490,6 +516,15 @@ const parent = "{{ parent }}";
 const $btnImg = $("#uploadBtn");
 const UP_ICON    = "/static/upload_button.png";
 const LOADING_GIF= "/static/loading.gif";
+
+function genQR() {
+    const url = window.location.href;
+    const encoded = btoa(url)
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+    window.open('/api/qr/' + encoded, '_blank');
+}
 
 function copyid(e){
   const s=e.target, t=s.textContent;

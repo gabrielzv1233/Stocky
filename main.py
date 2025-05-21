@@ -22,9 +22,7 @@ for root, _, files in os.walk("."):
                             value = value[1:-1]
                         os.environ[key] = value
 
-creds_data = base64.b64decode(os.environ['GOOGLE_CREDS']).decode() # Download creds JSON from Google Cloud Console and base64 encode it
-
-# Leave anything below this line alone unless you know what you're doing
+creds_data = base64.b64decode(os.environ['GOOGLE_CREDS']).decode()
 
 def extract_google_id(url: str) -> str:
     match = re.search(r'/folders/([a-zA-Z0-9_-]+)', url) or \

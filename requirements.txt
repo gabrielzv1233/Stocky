@@ -7,3 +7,4 @@ gspread
 sympy
 Pillow
 gunicorn
+qrcode

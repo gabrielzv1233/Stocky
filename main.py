@@ -3,10 +3,10 @@ import logging, time, json, random, re, uuid, os, base64, qrcode, gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.http import MediaIoBaseUpload
 from googleapiclient.discovery import build
+from PIL import Image, ImageOps
 from sympy import sympify
 from io import BytesIO
 from math import ceil
-from PIL import Image
 
 # load .env files, used for development
 for root, _, files in os.walk("."):
@@ -353,7 +353,7 @@ def upload_image(uid):
 
     full_url = f"https://drive.usercontent.google.com/download?id={fid}&authuser=0"
 
-    img = Image.open(BytesIO(raw)).convert("RGBA")
+    img = ImageOps.exif_transpose(Image.open(BytesIO(raw))).convert("RGBA")
     thumb = img.resize((128, 128), Image.Resampling.LANCZOS)
     thumb_name = f"{uid}_{uuid.uuid4().hex}_thumb.webp"
     thumb_path = os.path.join(UPLOAD_DIR, thumb_name)
@@ -367,7 +367,6 @@ def upload_image(uid):
     ws_items.update_cell(row, 6, json.dumps(imgs))
 
     return jsonify(success=True, image_path=thumb_url, full_path=full_url)
-
 
 @app.route('/api/delete_image/<uid>', methods=['POST'])
 def delete_image(uid):

@@ -143,9 +143,9 @@ def append_category(name, parent_id):
     ws_cats.append_row([new_id, name, parent_id or '']); return new_id
 
 def append_item(name, category_id):
-    uid = ''.join(str(random.randint(0,9)) for _ in range(10))
+    uid = int(''.join(str(random.randint(0, 9)) for _ in range(10)))
     ws_items.append_row([uid, name, 0, int(time.time()), category_id or '', ''])
-    return uid
+    return str(uid)
 
 def update_item_row(uid, name, count):
     row = find_item_row(uid); ts=int(time.time())

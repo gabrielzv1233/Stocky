@@ -170,6 +170,14 @@ def breadcrumb_parts(cat_id, cats):
         out.append(c['name']); cur=c['parent_id']
     return list(reversed(out))
 
+def build_breadcrumb(category):
+    parts = []
+    current = category
+    while current:
+        parts.append(current.name)
+        current = current.parent
+    parts.reverse()
+    return "/" + "/".join(parts) if parts else "/"
 def build_breadcrumb_str(cat_id,cats): return '/' + '/'.join(breadcrumb_parts(cat_id,cats)) if cat_id else '/'
 def build_breadcrumb_html(cat_id,cats): return '<b>/</b>' + '<b> / </b>'.join(breadcrumb_parts(cat_id,cats)) if cat_id else '<b>/</b>'
 
@@ -338,7 +346,7 @@ def move():
 
         anc=target_cat
         while anc:
-            if anc['id']==cat['id']: return jsonify(success=False,message='Cannot move into itself')
+            if anc['id']==cat['id']: return jsonify(success=False)
             anc = next((c for c in cats if c['id']==anc['parent_id']),None)
         if duplicate_exists(target_id,cat['name'],True,exclude=cat['id']):
             return jsonify(success=False,message='Name exists in target')
@@ -486,8 +494,7 @@ EXPLORER_HTML = """
 <!DOCTYPE html><html><head><meta charset="utf-8"><title>Stocky</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link rel="icon" href="https://newbo.co/wp-content/uploads/2022/11/newboco-logo-site-icon-300x300.jpg" sizes="192x192" />
-<style>
-body{background:#2c2c2c;color:#f0f0f0;font-family:Arial,sans-serif;margin:0}
+<style>body{background:#2c2c2c;color:#f0f0f0;font-family:Arial,sans-serif;margin:0}
 .explorer{padding:20px}.header{display:flex;flex-direction:column;gap:5px}
 .breadcrumb{padding-bottom:10px;font-size:14px}
 .controls{display:flex;justify-content:space-between;align-items:center}
@@ -495,6 +502,8 @@ body{background:#2c2c2c;color:#f0f0f0;font-family:Arial,sans-serif;margin:0}
 .list{margin-top:20px}.folder,.item{padding:10px;border:1px solid #444;margin-bottom:5px;cursor:pointer}
 .folder:hover,.item:hover{background:#444}.selected{border:2px solid #007bff}
 .back-folder{background:#333}.empty-message{color:#888;font-size:14px;padding-bottom:20px}
+.folder.drag-over, .item.drag-over {background-color: #555;}
+.folder, .item {-webkit-user-select: none;-moz-user-select: none;-ms-user-select: none;user-select: none;-webkit-touch-callout: none;}
 </style><script src="https://code.jquery.com/jquery-3.6.0.min.js"></script></head>
 <body><div class="explorer">
 <div class="header"><span class="breadcrumb">{{breadcrumb|safe}}</span>
@@ -505,20 +514,31 @@ body{background:#2c2c2c;color:#f0f0f0;font-family:Arial,sans-serif;margin:0}
 </div></div></div>
 <div class="list">
 {% if category.id %}
-  <div class="folder back-folder" ondblclick="goBack()">⬅️ ...</div>
-{% endif %}
-{% for cat in subcategories %}
-  <div class="folder" data-id="{{cat.id}}" onclick="selectItem(this,'category','{{cat.id}}')" ondblclick="openFolder({{cat.id}})">
-    📁 {{cat.name}}
-  </div>
-{% endfor %}
-{% for item in items %}
-  <div class="item" data-uid="{{item.uid}}" onclick="selectItem(this,'item','{{item.uid}}')" ondblclick="openItem('{{item.uid}}')">
-    📄 {{item.name}} ({{item.count}})
-  </div>
-{% endfor %}
-{% if not subcategories and not items %}
-  <div class="empty-message">📂 This folder is empty.</div>
+  <div class="folder back-folder" data-path="{{ parentPath }}" draggable="true"
+                    ondblclick="goBack()"
+                    ondragstart="dragStart(event, this)" ondragover="dragOver(event,this)" ondrop="drop(event, this)">
+                    ⬅️ ...
+                </div>
+            {% endif %}
+            {% for cat in subcategories %}
+                <div class="folder" data-id="{{ cat.id }}" data-path="{{ build_breadcrumb_str(cat.id, read_categories()) }}"
+                     draggable="true" 
+                     ondragstart="dragStart(event, this)" ondragover="dragOver(event,this)" ondragleave="dragLeave(event,this)" ondrop="drop(event, this)" 
+                     onclick="selectItem(this, 'category', '{{ cat.id }}')" ondblclick="openFolder({{ cat.id }})">
+                    📁 {{ cat.name }}
+                </div>
+            {% endfor %}
+            {% for item in items %}
+                <div class="item" data-uid="{{ item.uid }}" draggable="true" 
+                     ondragstart="dragStart(event, this)" onclick="selectItem(this, 'item', '{{ item.uid }}')" 
+                     ondblclick="openItem('{{ item.uid }}')">
+                    📄 {{ item.name }} ({{ item.count }})
+                </div>
+            {% endfor %}
+            {% if not subcategories and not items %}
+                <div class="empty-message">
+                    📂 This folder is empty.
+                </div>
 {% endif %}
 </div></div>
 <script>
@@ -530,6 +550,39 @@ function openItem(uid){const p=new URLSearchParams(location.search);const c=p.ge
 function newSubCategory(){const name=prompt("Enter sub category name:");if(!name)return;$.post("/api/new_category",{name,parent_id:'{{category.id if category.id else ""}}'}).done(d=>d.success?location.reload():alert(d.message))}
 function newItem(){const name=prompt("Enter item name:");if(!name)return;$.post("/api/new_item",{name,category_id:'{{category.id if category.id else ""}}'}).done(d=>d.success?location.reload():alert(d.message))}
 function deleteSelected(){if(!selected)return alert("Select something first.");if(!confirm("Delete "+selected.type+"?"))return;$.post("/api/delete",selected).done(d=>d.success?location.reload():alert(d.message))}
+  function dragStart(e,el){
+    let type = el.classList.contains("folder") ? "category" : "item";
+    let id   = type==="category" ? el.dataset.id : el.dataset.uid;
+    e.dataTransfer.setData("application/json", JSON.stringify({type,id}));
+  }
+
+  function dragOver(e,el){
+    e.preventDefault();
+    el.classList.add("drag-over");
+  }
+
+  function dragLeave(e,el){
+    el.classList.remove("drag-over");
+  }
+
+  function drop(e,el){
+    e.preventDefault();
+    el.classList.remove("drag-over");
+    let raw = e.dataTransfer.getData("application/json");
+    if(!raw) return;
+    let obj = JSON.parse(raw);
+    let path = el.getAttribute("data-path");
+    if(!path) return alert("Invalid drop target");
+    $.post("/api/move", { type: obj.type, id: obj.id, path }, res => {
+  if (!res.success) {
+    if (res.message) { 
+      alert(res.message);
+    }
+  } else {
+    location.reload();
+  }
+    });
+  }
 </script></body></html>
 """
 

@@ -346,7 +346,7 @@ def move():
 
         anc=target_cat
         while anc:
-            if anc['id']==cat['id']: return jsonify(success=False,message='Cannot move into itself')
+            if anc['id']==cat['id']: return jsonify(success=False)
             anc = next((c for c in cats if c['id']==anc['parent_id']),None)
         if duplicate_exists(target_id,cat['name'],True,exclude=cat['id']):
             return jsonify(success=False,message='Name exists in target')
@@ -574,8 +574,15 @@ function deleteSelected(){if(!selected)return alert("Select something first.");i
     let path = el.getAttribute("data-path");
     if(!path) return alert("Invalid drop target");
     $.post("/api/move", { type: obj.type, id: obj.id, path }, res => {
-      if(!res.success) alert(res.message);
-      else location.reload();
+  if (!res.success) {
+    if (res.message) { 
+      alert(res.message);
+    }
+  } else {
+    location.reload();
+  }
+});
+
     });
   }
 </script></body></html>

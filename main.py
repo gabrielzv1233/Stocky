@@ -482,6 +482,7 @@ def view_image(filename):
 EXPLORER_HTML = """
 <!DOCTYPE html><html><head><meta charset="utf-8"><title>Stocky</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" href="https://newbo.co/wp-content/uploads/2022/11/newboco-logo-site-icon-300x300.jpg" sizes="192x192" />
 <style>
 body{background:#2c2c2c;color:#f0f0f0;font-family:Arial,sans-serif;margin:0}
 .explorer{padding:20px}.header{display:flex;flex-direction:column;gap:5px}
@@ -532,6 +533,7 @@ function deleteSelected(){if(!selected)return alert("Select something first.");i
 EDITOR_HTML = """
 <!DOCTYPE html><html><head><meta charset='utf-8'><title>Stocky – Edit</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" href="https://newbo.co/wp-content/uploads/2022/11/newboco-logo-site-icon-300x300.jpg" sizes="192x192" />
 <style>
 body{background:#2c2c2c;color:#f0f0f0;font-family:Arial,sans-serif;padding:20px}
 .editor{max-width:600px;margin:auto}

@@ -1,9 +1,11 @@
 from flask import Flask, request, jsonify, render_template_string, send_file, url_for, session, redirect,  send_from_directory
 import logging, time, json, random, re, uuid, os, base64, qrcode, gspread, hashlib
+from authlib.integrations.base_client.errors import MismatchingStateError
 from google.oauth2.service_account import Credentials
 from authlib.integrations.flask_client import OAuth
 from googleapiclient.http import MediaIoBaseUpload
 from googleapiclient.discovery import build
+from gspread.exceptions import APIError
 from PIL import Image, ImageOps
 from sympy import sympify
 from io import BytesIO
@@ -182,6 +184,49 @@ def build_breadcrumb_str(cat_id,cats): return '/' + '/'.join(breadcrumb_parts(ca
 def build_breadcrumb_html(cat_id,cats): return '<b>/</b>' + '<b> / </b>'.join(breadcrumb_parts(cat_id,cats)) if cat_id else '<b>/</b>'
 
 ENABLE_AUTH_REQ = os.environ.get("ENABLE_AUTH_REQ", "False").lower() in ("1", "true", "yes")
+
+@app.errorhandler(APIError)
+def handle_gspread_api_error(e):
+    app.logger.exception(e)
+    return render_template_string("""
+    <!doctype html>
+    <html>
+      <head><meta charset="utf-8"><title>Spreadsheet API Error</title>
+        <style>
+          body { font-family: sans-serif; background: #f8f8f8; padding: 2rem; }
+          .container { max-width: 600px; margin: auto; background: white; padding: 1rem 2rem; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+          details { margin-top: 1rem; }
+          pre { background: #eee; padding: 1rem; overflow-x: auto; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <h1>External API Error</h1>
+          <p>An external error has happened with the Google Spreadsheets API.</p>
+          <details>
+            <summary>Show technical details</summary>
+            <pre>{{ e }}</pre>
+          </details>
+        </div>
+      </body>
+    </html>
+    """, e=e), 500
+
+@app.errorhandler(MismatchingStateError)
+def handle_mismatch_state(e):
+    app.logger.warning("OAuth state mismatch: %s", e)
+    return render_template_string("""
+    <!doctype html>
+    <html>
+      <head><meta charset="utf-8"><title>Session Expired</title></head>
+      <body>
+        <script>
+          alert("Your session has refreshed. Please log in again.");
+          window.location.href = "{{ url_for('login') }}";
+        </script>
+      </body>
+    </html>
+    """), 302
 
 @app.before_request
 def require_login():

@@ -494,8 +494,7 @@ EXPLORER_HTML = """
 <!DOCTYPE html><html><head><meta charset="utf-8"><title>Stocky</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link rel="icon" href="https://newbo.co/wp-content/uploads/2022/11/newboco-logo-site-icon-300x300.jpg" sizes="192x192" />
-<style>
-body{background:#2c2c2c;color:#f0f0f0;font-family:Arial,sans-serif;margin:0}
+<style>body{background:#2c2c2c;color:#f0f0f0;font-family:Arial,sans-serif;margin:0}
 .explorer{padding:20px}.header{display:flex;flex-direction:column;gap:5px}
 .breadcrumb{padding-bottom:10px;font-size:14px}
 .controls{display:flex;justify-content:space-between;align-items:center}
@@ -504,7 +503,7 @@ body{background:#2c2c2c;color:#f0f0f0;font-family:Arial,sans-serif;margin:0}
 .folder:hover,.item:hover{background:#444}.selected{border:2px solid #007bff}
 .back-folder{background:#333}.empty-message{color:#888;font-size:14px;padding-bottom:20px}
 .folder.drag-over, .item.drag-over {background-color: #555;}
-
+.folder, .item {-webkit-user-select: none;-moz-user-select: none;-ms-user-select: none;user-select: none;-webkit-touch-callout: none;}
 </style><script src="https://code.jquery.com/jquery-3.6.0.min.js"></script></head>
 <body><div class="explorer">
 <div class="header"><span class="breadcrumb">{{breadcrumb|safe}}</span>
@@ -551,7 +550,6 @@ function openItem(uid){const p=new URLSearchParams(location.search);const c=p.ge
 function newSubCategory(){const name=prompt("Enter sub category name:");if(!name)return;$.post("/api/new_category",{name,parent_id:'{{category.id if category.id else ""}}'}).done(d=>d.success?location.reload():alert(d.message))}
 function newItem(){const name=prompt("Enter item name:");if(!name)return;$.post("/api/new_item",{name,category_id:'{{category.id if category.id else ""}}'}).done(d=>d.success?location.reload():alert(d.message))}
 function deleteSelected(){if(!selected)return alert("Select something first.");if(!confirm("Delete "+selected.type+"?"))return;$.post("/api/delete",selected).done(d=>d.success?location.reload():alert(d.message))}
-// DRAG & DROP
   function dragStart(e,el){
     let type = el.classList.contains("folder") ? "category" : "item";
     let id   = type==="category" ? el.dataset.id : el.dataset.uid;

@@ -198,6 +198,9 @@ def logout():
 
 @app.route('/authorize')
 def authorize():
+    ALLOWED_DOMAINS = os.environ.get('ALLOWED_DOMAINS', '').split(',')
+    ALLOWED_EMAILS = os.environ.get('ALLOWED_EMAILS', '').split(',')
+    
     token = google.authorize_access_token()
     user_info = google.get('https://openidconnect.googleapis.com/v1/userinfo').json()
     email = user_info.get('email')
